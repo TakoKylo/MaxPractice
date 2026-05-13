@@ -10,7 +10,7 @@ using Unity.Netcode;
 using UnityEngine;
 using MaxPractice;
 
-public class MaxPracticePlugin : IPuckMod
+public class MaxPracticePlugin : IPuckPlugin
 {
     public static MaxPracticePlugin Instance { get; private set; }
     private Harmony harmony;

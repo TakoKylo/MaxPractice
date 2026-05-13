@@ -21,14 +21,34 @@
     <DeployDir>$(GameDir)\Plugins\MaxPractice</DeployDir>
   </PropertyGroup>
 
-    <ItemGroup>
-    <Libs Include="libs\*.dll" Exclude="libs\System.*.dll" />
+    <!--
+      Reference EVERY DLL from the live game's Managed folder so we always
+      build against the current build (B323). Local libs/ is kept only for
+      a few packages the game doesn't ship (SocketIO, etc).
 
-    <Reference Include="@(Libs)">
-      <HintPath>%(Libs.FullPath)</HintPath>
-      <Private>false</Private>
-    </Reference>
-  </ItemGroup>
+      Past pitfall: libs/ used to contain stale copies of every game DLL
+      from B202, which silently shadowed live references and made the mod
+      build against IPuckMod (B202) instead of IPuckPlugin (B323+) — so the
+      server's mod loader couldn't find a plugin and the mod never loaded.
+    -->
+    <ItemGroup>
+      <!-- Exclude BCL/system DLLs that conflict with the .NET Framework
+           reference assemblies already provided by the SDK (mscorlib,
+           netstandard, System.*). The game ships its own copies but using
+           them at compile time produces CS0433 duplicate-type errors. -->
+      <GameLibs Include="$(GameManaged)\*.dll"
+                Exclude="$(GameManaged)\System.dll;$(GameManaged)\System.*.dll;$(GameManaged)\mscorlib.dll;$(GameManaged)\netstandard.dll" />
+      <Reference Include="@(GameLibs)">
+        <HintPath>%(GameLibs.FullPath)</HintPath>
+        <Private>false</Private>
+      </Reference>
+
+      <ExtraLibs Include="libs\*.dll" Exclude="libs\System.*.dll" />
+      <Reference Include="@(ExtraLibs)">
+        <HintPath>%(ExtraLibs.FullPath)</HintPath>
+        <Private>false</Private>
+      </Reference>
+    </ItemGroup>
 
   <!-- References to game assemblies -->
   <ItemGroup>

@@ -109,12 +109,11 @@ namespace MaxPractice
             get
             {
                 if (_configDir != null) return _configDir;
-                string gameRoot = Application.dataPath;
-                if (gameRoot.EndsWith("Puck_Data"))
-                {
-                    gameRoot = Directory.GetParent(gameRoot).FullName;
-                }
-                string configFolder = Path.Combine(gameRoot, "config");
+                // Match the standard Puck-mod convention: <cwd>/config
+                // Puck (client and dedicated server) launches with the install
+                // directory as the working directory. Application.dataPath
+                // didn't resolve correctly on Linux dedicated servers.
+                string configFolder = Path.Combine(Path.GetFullPath("."), "config");
                 if (!Directory.Exists(configFolder))
                 {
                     Directory.CreateDirectory(configFolder);
