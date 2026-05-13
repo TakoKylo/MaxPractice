@@ -181,6 +181,31 @@ public class MaxPracticePlugin : IPuckMod
                 ConfigManager.Log("Patched PlayerBody.FixedUpdate (infinite stamina)");
             }
 
+            // Patch the warmup countdown tick so PauseWarmupTimer can freeze it.
+            // B310 names this method Server_Tick (B202 called it Server_OnGameStateTick);
+            // try the current name first and fall back so the patch survives a future rename.
+            try
+            {
+                var gmType = AccessTools.TypeByName("GameManager");
+                var tickMethod = gmType != null
+                    ? (AccessTools.DeclaredMethod(gmType, "Server_Tick")
+                       ?? AccessTools.DeclaredMethod(gmType, "Server_OnGameStateTick"))
+                    : null;
+                if (tickMethod != null)
+                {
+                    harmony.Patch(tickMethod, prefix: new HarmonyMethod(typeof(WarmupTimerPausePatch), "Prefix"));
+                    ConfigManager.Log($"Patched GameManager.{tickMethod.Name} (warmup pause)");
+                }
+                else
+                {
+                    Debug.LogWarning("[MaxPractice] Could not find GameManager tick method - PauseWarmupTimer will not work");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("[MaxPractice] Failed to patch GameManager tick method: " + ex.Message);
+            }
+
             ConfigManager.Log("Enabled and patched");
             return true;
         }

@@ -13,8 +13,8 @@ namespace MaxPractice
         // ============================================================
         // GENERAL
         // ============================================================
-        public int ConfigVersion = 3;
-        
+        public int ConfigVersion = 4;
+
         // ============================================================
         // LIMITS
         // ============================================================
@@ -24,6 +24,10 @@ namespace MaxPractice
         public float SavePracDurationSeconds = 120f;
         public int MaxPucksBeforeCleanup = 30;
         public bool GoalieAIPersistDuringGame = false;
+
+        // When true, the warmup countdown is paused (timer never decrements
+        // while Phase == Warmup), so practice-only servers never start games.
+        public bool PauseWarmupTimer = false;
         
         // ============================================================
         // COMMAND ENABLE/DISABLE
@@ -97,7 +101,7 @@ namespace MaxPractice
         private static string _configDir = null;
         private static string _configFile = null;
         
-        private const int CONFIG_VERSION = 3;
+        private const int CONFIG_VERSION = 4;
         private const string VERSION_KEY = "\"ConfigVersion\":";
         
         private static string ConfigDir

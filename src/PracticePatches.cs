@@ -955,20 +955,16 @@ public static class VoteManager_Server_CreateVote_Patch
             
             var allPlayers = playerManager.GetPlayers(false);
             int fakeCount = 0;
-            
-            // Count AI goalies
-            fakeCount += MaxPracticePlugin.FakePlayers.Count;
-            
-            // Also check for traffic dummies
+
+            // Count EVERY fake player present (goalie AI + traffic + passers).
+            // The detector identifies them by client ID range / username, so we
+            // don't double-count entries that are also in FakePlayers.
             foreach (var player in allPlayers)
             {
-                if (FakePlayerDetector.IsTrafficDummy(player))
-                {
+                if (FakePlayerDetector.IsAnyFakePlayer(player))
                     fakeCount++;
-                    break; // Just need to know if any exist
-                }
             }
-            
+
             if (fakeCount == 0)
                 return; // No fake players detected
             
@@ -988,6 +984,52 @@ public static class VoteManager_Server_CreateVote_Patch
         {
             Debug.LogError($"[MaxPractice] VoteManager.Server_CreateVote patch error: {ex.Message}\n{ex.StackTrace}");
         }
+    }
+}
+
+// ============================================================================
+// WARMUP TIMER PAUSE - For practice-only servers
+// When ModConfig.PauseWarmupTimer is true, the warmup countdown is suppressed
+// so the server never transitions out of warmup on its own. Manual phase
+// changes (admin commands, etc.) still work because we only skip the periodic
+// game-state tick while Phase == Warmup.
+//
+// Reference (B310 decompile, GameManager.cs):
+//   private void Server_Tick() {
+//     int? tick = Mathf.Max(0, GameState.Value.Tick - 1);
+//     Server_SetGameState(null, tick);
+//   }
+// Phase transitions happen in BaseGameMode.OnGameStateChanged when Tick hits 0
+// (BaseGameMode.cs:205-213). Skipping Server_Tick keeps Tick > 0 so the
+// transition never fires while we're in warmup.
+// ============================================================================
+
+/// <summary>
+/// Patched dynamically in MaxPracticePlugin.OnEnable() against
+/// GameManager.Server_Tick (B310) / Server_OnGameStateTick (B202) — we cannot
+/// rely on a compile-time HarmonyPatch attribute because if the method ever
+/// gets renamed in a future build, PatchAll() would fail and take every other
+/// patch down with it.
+/// </summary>
+public static class WarmupTimerPausePatch
+{
+    public static bool Prefix()
+    {
+        try
+        {
+            if (!ConfigManager.Config.PauseWarmupTimer) return true;
+            if (!NetworkManager.Singleton.IsServer) return true;
+
+            var gm = NetworkBehaviourSingleton<GameManager>.Instance;
+            if (gm == null) return true;
+
+            // Only freeze the tick while we're in warmup so non-warmup phases
+            // (face-off, playing, replay, etc.) continue ticking normally.
+            if (gm.Phase == GamePhase.Warmup)
+                return false;
+        }
+        catch { }
+        return true;
     }
 }
 

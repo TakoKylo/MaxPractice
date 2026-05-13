@@ -1279,6 +1279,7 @@ namespace MaxPractice
 
             AddServerSectionHeader("MISC");
             _serverSectionVE.Add(MakeServerConfigRow("Goalie AI Persists During Game", cfg.GoalieAIPersistDuringGame));
+            _serverSectionVE.Add(MakeServerConfigRow("Pause Warmup Timer (Practice-Only Server)", cfg.PauseWarmupTimer));
         }
 
         private void AddServerSectionHeader(string text)
