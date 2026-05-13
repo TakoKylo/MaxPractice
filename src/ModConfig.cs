@@ -13,7 +13,7 @@ namespace MaxPractice
         // ============================================================
         // GENERAL
         // ============================================================
-        public int ConfigVersion = 4;
+        public int ConfigVersion = 5;
 
         // ============================================================
         // LIMITS
@@ -28,6 +28,10 @@ namespace MaxPractice
         // When true, the warmup countdown is paused (timer never decrements
         // while Phase == Warmup), so practice-only servers never start games.
         public bool PauseWarmupTimer = false;
+
+        // When true, blocks the game-starting vote commands /vs (vote-start)
+        // and /vw (vote-warmup) on the server. /vk (vote-kick) is unaffected.
+        public bool DisableVoting = false;
         
         // ============================================================
         // COMMAND ENABLE/DISABLE
@@ -101,7 +105,7 @@ namespace MaxPractice
         private static string _configDir = null;
         private static string _configFile = null;
         
-        private const int CONFIG_VERSION = 4;
+        private const int CONFIG_VERSION = 5;
         private const string VERSION_KEY = "\"ConfigVersion\":";
         
         private static string ConfigDir

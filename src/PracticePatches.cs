@@ -934,25 +934,49 @@ public static class VoteManager_Server_CreateVote_Patch
 {
     [HarmonyPrefix]
     [HarmonyPriority(Priority.First)]
-    public static void Prefix(VoteManager __instance, VoteType voteType, ref int votesNeeded, Player startedBy, object data = null)
+    public static bool Prefix(VoteManager __instance, VoteType voteType, ref int votesNeeded, Player startedBy, object data = null)
     {
         try
         {
             // Only run on server
             if (!NetworkManager.Singleton.IsServer)
-                return;
-            
+                return true;
+
+            // DisableVoting blocks /vs and /vw entirely on practice-only servers.
+            // /vk (Kick) is intentionally left alone — it's a moderation tool,
+            // not a way to start games. VoteManagerController.cs:36-61 shows
+            // both /vs and /vw funnel through here as VoteType.Start/Warmup.
+            if (ConfigManager.Config.DisableVoting &&
+                (voteType == VoteType.Start || voteType == VoteType.Warmup))
+            {
+                try
+                {
+                    ulong clientId = startedBy != null && startedBy.NetworkObject != null
+                        ? startedBy.NetworkObject.OwnerClientId
+                        : 0UL;
+                    if (clientId != 0UL)
+                    {
+                        PracticeHelpers.SendMessageToPlayer(
+                            clientId,
+                            "<size=70%><color=#FF6666>Game-start voting is disabled on this practice server.</color></size>");
+                    }
+                }
+                catch { }
+                Debug.Log($"[MaxPractice] Blocked {voteType} vote (DisableVoting=true)");
+                return false; // skip original — vote never created
+            }
+
             // If no fake players, let it pass through unchanged
             if (MaxPracticePlugin.FakePlayers.Count == 0)
-                return;
-            
+                return true;
+
             Debug.Log($"[MaxPractice] Detected vote creation with votesNeeded={votesNeeded}");
-            
+
             // Get real player count by excluding fake players
             var playerManager = MonoBehaviourSingleton<PlayerManager>.Instance;
             if (playerManager == null)
-                return;
-            
+                return true;
+
             var allPlayers = playerManager.GetPlayers(false);
             int fakeCount = 0;
 
@@ -966,17 +990,17 @@ public static class VoteManager_Server_CreateVote_Patch
             }
 
             if (fakeCount == 0)
-                return; // No fake players detected
-            
+                return true; // No fake players detected
+
             Debug.Log($"[MaxPractice] Found {fakeCount} fake players out of {allPlayers.Count} total");
-            
+
             // Recalculate votesNeeded: subtract EACH fake player from the count
             int realPlayerCount = allPlayers.Count - fakeCount;
             if (realPlayerCount < 1) realPlayerCount = 1;
-            
+
             int correctedVotesNeeded = UnityEngine.Mathf.RoundToInt((float)realPlayerCount / 2f + 0.5f);
             if (correctedVotesNeeded < 1) correctedVotesNeeded = 1;
-            
+
             Debug.Log($"[MaxPractice] Correcting votesNeeded: {votesNeeded} → {correctedVotesNeeded} (real players: {realPlayerCount})");
             votesNeeded = correctedVotesNeeded;
         }
@@ -984,6 +1008,7 @@ public static class VoteManager_Server_CreateVote_Patch
         {
             Debug.LogError($"[MaxPractice] VoteManager.Server_CreateVote patch error: {ex.Message}\n{ex.StackTrace}");
         }
+        return true;
     }
 }
 
