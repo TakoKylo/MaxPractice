@@ -54,24 +54,30 @@ namespace MaxPractice
             return 0UL;
         }
         
-        /// <summary>
-        // ── Pending-chat queue (MuteMod pattern for dedicated-server compatibility) ──
+        // ── Pending-chat queue (queued so we can send from any thread / lifecycle moment;
+        // FlushPendingChats drains it once a frame from PracticeManager.Update on the main
+        // thread, after NetworkManager.Singleton.IsServer is verified).
+        //
+        // Uses the STRING overload of ChatManager.Server_BroadcastChatMessage /
+        // Server_SendChatMessageToClients — the same path OpenWorldPracticeMod uses. The
+        // ChatMessage-struct overload would let us set Username/SteamID/etc, but with those
+        // fields null the client-side AddChatMessage drops the message silently. The string
+        // overloads build a proper system ChatMessage server-side and ship it intact.
         private struct PendingChatSend
         {
-            public ulong[] ClientIds;
-            public ChatMessage Message;
+            public ulong ClientId; // 0 = broadcast to everyone
+            public string Content;
         }
         private static readonly Queue<PendingChatSend> _pendingChatSends = new Queue<PendingChatSend>();
 
-        private static void EnqueueSystemChat(ulong[] clientIds, string msg)
+        private static void EnqueueSystemChat(ulong clientId, string msg)
         {
-            if (clientIds == null || clientIds.Length == 0) return;
             lock (_pendingChatSends)
             {
                 _pendingChatSends.Enqueue(new PendingChatSend
                 {
-                    ClientIds = clientIds,
-                    Message = CreateSystemChatMessage(msg),
+                    ClientId = clientId,
+                    Content = msg ?? string.Empty,
                 });
             }
         }
@@ -91,46 +97,25 @@ namespace MaxPractice
                     if (_pendingChatSends.Count == 0) break;
                     pending = _pendingChatSends.Dequeue();
                 }
-                if (pending.ClientIds != null && pending.ClientIds.Length > 0)
-                    chatManager.Server_SendChatMessageToClients(pending.Message, pending.ClientIds);
+                try
+                {
+                    if (pending.ClientId == 0UL)
+                        chatManager.Server_BroadcastChatMessage(pending.Content);
+                    else
+                        chatManager.Server_SendChatMessageToClients(pending.Content, new[] { pending.ClientId });
+                }
+                catch { }
             }
         }
 
-        private static ChatMessage CreateSystemChatMessage(string msg)
-        {
-            return new ChatMessage
-            {
-                Username = null,
-                Content = new FixedString512Bytes(msg ?? string.Empty),
-                Timestamp = Time.realtimeSinceStartupAsDouble,
-                IsQuickChat = false,
-                IsTeamChat = false,
-                IsSystem = true,
-                SteamID = null,
-                Team = null,
-            };
-        }
-
-        private static ulong[] GetConnectedClientIds()
-        {
-            var nm = NetworkManager.Singleton;
-            if (nm == null) return Array.Empty<ulong>();
-            var ids = new ulong[nm.ConnectedClientsList.Count];
-            for (int i = 0; i < nm.ConnectedClientsList.Count; i++)
-                ids[i] = nm.ConnectedClientsList[i].ClientId;
-            return ids;
-        }
-
-        /// B310 compatibility: Send system chat message. Gracefully handles API changes.
+        /// <summary>
+        /// Send a system chat message. clientId=0 broadcasts to everyone; otherwise targets that client.
+        /// The first parameter (UIChat) is unused — kept for back-compat with existing call sites.
         /// </summary>
         public static void SendChatMessage(UIChat ui, string message, ulong clientId = 0)
         {
-            try
-            {
-                ulong[] clientIds = clientId > 0 ? new ulong[] { clientId } : GetConnectedClientIds();
-                EnqueueSystemChat(clientIds, message);
-            }
-            catch { } // Silently fail if chat API not available
+            try { EnqueueSystemChat(clientId, message); }
+            catch { }
         }
 
         public static PlayerTeam GetPlayerTeam(Player player)

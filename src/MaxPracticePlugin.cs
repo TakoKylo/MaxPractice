@@ -223,6 +223,14 @@ public class MaxPracticePlugin : IPuckPlugin
             var manager = GameObject.Find("MaxPracticeManager");
             if (manager != null) UnityEngine.Object.Destroy(manager);
 
+            // Cleanup goalie AI through the manager so it clears its component refs and AutoEnabled state.
+            try
+            {
+                MaxPractice.GoalieAIManager.SetAutoEnabled(false);
+                MaxPractice.GoalieAIManager.DespawnAll();
+            }
+            catch { }
+
             // Cleanup dummy goalies
             CleanupDummies();
             

@@ -5,38 +5,51 @@ using Unity.Netcode;
 using UnityEngine;
 using MaxPractice;
 
-// Warmup goal detector - deletes pucks that enter goal and announces it
+// Warmup goal detector - deletes pucks that enter goal and announces it.
+// Periodically re-checks attachment so handlers survive level/scene reloads (new GoalTrigger
+// instances would otherwise be left unpatched after the one-shot startup pass).
 public class WarmupGoalDetector : MonoBehaviour
 {
-    private bool isPatched = false;
-    private float checkDelay = 2f;
-    
-    void OnEnable()
+    private float nextCheckTime = 0f;
+    private const float CheckInterval = 4f;
+    private int handlersAttachedSoFar = 0;
+
+    void Update()
     {
-        StartCoroutine(InitializeGoalDetection());
+        if (Time.time < nextCheckTime) return;
+        nextCheckTime = Time.time + CheckInterval;
+
+        if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer) return;
+
+        // Only bother attaching when a goalie-relevant phase is active; cheap enough either way.
+        var gm = NetworkBehaviourSingleton<GameManager>.Instance;
+        if (gm == null) return;
+
+        EnsureHandlersAttached();
     }
-    
-    System.Collections.IEnumerator InitializeGoalDetection()
+
+    private void EnsureHandlersAttached()
     {
-        yield return new WaitForSeconds(checkDelay);
-        int retries = 0;
-        while (!isPatched && retries < 20)
+        try
         {
             var goalTriggers = UnityEngine.Object.FindObjectsByType<GoalTrigger>(UnityEngine.FindObjectsSortMode.None);
-            if (goalTriggers.Length > 0)
+            if (goalTriggers == null || goalTriggers.Length == 0) return;
+
+            foreach (var trigger in goalTriggers)
             {
-                foreach (var trigger in goalTriggers)
+                if (trigger == null) continue;
+                if (trigger.gameObject.GetComponent<WarmupGoalTriggerHandler>() == null)
                 {
-                    if (trigger != null && trigger.gameObject.GetComponent<WarmupGoalTriggerHandler>() == null)
-                    {
-                        trigger.gameObject.AddComponent<WarmupGoalTriggerHandler>();
-                    }
+                    trigger.gameObject.AddComponent<WarmupGoalTriggerHandler>();
+                    handlersAttachedSoFar++;
+                    Debug.Log($"[MaxPractice] Attached WarmupGoalTriggerHandler to '{trigger.gameObject.name}' " +
+                              $"at {trigger.transform.position} (total attached so far: {handlersAttachedSoFar})");
                 }
-                isPatched = true;
-                break;
             }
-            retries++;
-            yield return new WaitForSeconds(0.5f);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[MaxPractice] WarmupGoalDetector.EnsureHandlersAttached: {ex.Message}");
         }
     }
 }
@@ -63,14 +76,26 @@ public class WarmupGoalTriggerHandler : MonoBehaviour
         try
         {
             if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer) return;
-            
+
             var gm = NetworkBehaviourSingleton<GameManager>.Instance;
             if (gm == null || gm.Phase != GamePhase.Warmup) return;
-            
+
             Puck puck = collider.GetComponentInParent<Puck>();
             if (puck == null) return;
 
             Debug.Log($"[MaxPractice] Warmup goal trigger hit by puck {puck.NetworkObjectId}");
+
+            // Notify GoalieAIManager so the AI goalie that just got scored on plays its sad
+            // reaction (and the other AI, if present, celebrates). During warmup the game's
+            // normal Server_NotifyGoalScoredRpc / BlueScore-RedScore phase transitions don't
+            // fire, so this trigger is the only signal that a goal happened.
+            // Goal trigger at z<0 = red goal (so blue team scored), at z>0 = blue goal (red scored).
+            try
+            {
+                PlayerTeam scoringTeam = transform.position.z < 0f ? PlayerTeam.Blue : PlayerTeam.Red;
+                MaxPractice.GoalieAIManager.OnGoalScored(scoringTeam);
+            }
+            catch (Exception e) { Debug.LogError($"[MaxPractice] Warmup goal reaction error: {e.Message}"); }
 
             // Delete the puck and respawn a new one at center
             StartCoroutine(DeletePuckAndRespawn(puck));

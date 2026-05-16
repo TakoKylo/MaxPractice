@@ -284,6 +284,14 @@ public class PracticeManager : MonoBehaviour
 
         PracticeHelpers.FlushPendingChats();
 
+        // Goalie AI lifecycle + vote tracking every frame (cheap; internal throttles guard the work).
+        GoalieAIManager.Tick();
+        GoalieVote.Tick();
+
+        // Notify the goalie AI manager of phase changes so it can run intermission/sad/teleport hooks.
+        var gmPhase = NetworkBehaviourSingleton<GameManager>.Instance;
+        if (gmPhase != null) GoalieAIManager.NotifyPhase(gmPhase.Phase);
+
         if (Time.realtimeSinceStartup < nextCheckTime) return;
         nextCheckTime = Time.realtimeSinceStartup + 10f;
 
@@ -372,8 +380,11 @@ public class PracticeManager : MonoBehaviour
         MaxPracticePlugin.HandlePucks.Clear();
         MaxPracticePlugin.HandleUseCount.Clear();
         
-        // Only cleanup goalie AI if config says so (default: cleanup on phase change)
-        if (!cfg.GoalieAIPersistDuringGame)
+        // Keep goalie dummies through phase transitions if EITHER the always-on config OR a
+        // passed /votegoalies vote (GoalieAIManager.AutoEnabled) says they should persist.
+        // Otherwise CleanupDummies wipes them on the Warmup→PreGame transition and we end up
+        // with no AI goalies until they're re-evaluated 1s later.
+        if (!cfg.GoalieAIPersistDuringGame && !GoalieAIManager.AutoEnabled)
         {
             MaxPracticePlugin.CleanupDummies();
         }
@@ -455,66 +466,7 @@ public class PracticeManager : MonoBehaviour
     {
         try
         {
-            bool isRed = team == PlayerTeam.Red;
-            
-            var playerManager = MonoBehaviourSingleton<PlayerManager>.Instance;
-            if (playerManager == null) return;
-
-            var playerPrefabField = typeof(PlayerManager).GetField("playerPrefab", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            Player playerPrefab = (Player)playerPrefabField?.GetValue(playerManager);
-            if (playerPrefab == null) return;
-
-            Player botPlayer = UnityEngine.Object.Instantiate(playerPrefab);
-            NetworkObject netObj = botPlayer.GetComponent<NetworkObject>();
-
-            ulong fakeClientId = 1111111UL + (ulong)(isRed ? 1 : 0);
-            netObj.SpawnWithOwnership(fakeClientId, true);
-
-            botPlayer.Username.Value = new Unity.Collections.FixedString32Bytes(isRed ? "DummyRed" : "DummyBlue");
-            botPlayer.SteamId.Value = new Unity.Collections.FixedString32Bytes(isRed ? "DummyRed" : "DummyBlue"); // Set SteamId for filtering
-            botPlayer.Server_SetGameState(phase: null, team: team, role: PlayerRole.Goalie, delay: 0f);
-            botPlayer.Number.Value = 62;
-            // B310: Cosmetics are now int-based IDs - but properties don't exist in current build
-            // try { botPlayer.GoalieRedSkinID.Value = 0; } catch (Exception) { }
-            // try { botPlayer.GoalieBlueSkinID.Value = 0; } catch (Exception) { }
-
-            // Dynamic goal position (supports CompAdjustments goal scaling)
-            Vector3 goalPos = isRed ? new Vector3(0f, 0f, -40.23f) : new Vector3(0f, 0f, 40.23f);
-            try
-            {
-                var goals = UnityEngine.Object.FindObjectsByType<Goal>(FindObjectsSortMode.None);
-                foreach (var g in goals)
-                {
-                    if (g == null) continue;
-                    // Determine team from position (red goal at z < 0, blue at z > 0)
-                    bool isGoalRed = g.transform.position.z < 0;
-                    if (isGoalRed == isRed)
-                    {
-                        goalPos = g.transform.position;
-                        goalPos.y = 0f;
-                        break;
-                    }
-                }
-            }
-            catch (Exception) { }
-            Vector3 spawnPos = goalPos;
-            spawnPos.z += isRed ? 1.5f : -1.5f;
-            spawnPos.y = 0f;
-
-            Quaternion spawnRot = Quaternion.LookRotation(isRed ? Vector3.forward : Vector3.back);
-            botPlayer.Server_SpawnCharacter(spawnPos, spawnRot, PlayerRole.Goalie);
-
-            MaxPracticePlugin.FakePlayers.Add(botPlayer);
-            if (isRed)
-                MaxPracticePlugin.RedTeamDummy = botPlayer;
-            else
-                MaxPracticePlugin.BlueTeamDummy = botPlayer;
-
-            SimpleGoalieAI ai = botPlayer.gameObject.AddComponent<SimpleGoalieAI>();
-            ai.controlledPlayer = botPlayer;
-            ai.team = team;
-
-                ConfigManager.Dbg($"[MaxPractice] Auto-spawned {(isRed ? "red" : "blue")} goalie dummy with AI attached");
+            GoalieAIManager.SpawnAIGoalie(team);
         }
         catch (Exception ex)
         {

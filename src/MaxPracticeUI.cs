@@ -1278,7 +1278,8 @@ namespace MaxPractice
             _serverSectionVE.Add(MakeServerConfigRow("Tap Commands", cfg.EnableTapCommands));
 
             AddServerSectionHeader("MISC");
-            _serverSectionVE.Add(MakeServerConfigRow("Goalie AI Persists During Game", cfg.GoalieAIPersistDuringGame));
+            _serverSectionVE.Add(MakeServerConfigRow("Goalie AI Persists During Game (Always-On)", cfg.GoalieAIPersistDuringGame));
+            _serverSectionVE.Add(MakeServerConfigRow("Enable Goalie AI Voting (/votegoalies)", cfg.EnableGoalieVoting));
             _serverSectionVE.Add(MakeServerConfigRow("Pause Warmup Timer (Practice-Only Server)", cfg.PauseWarmupTimer));
             _serverSectionVE.Add(MakeServerConfigRow("Disable Voting (Blocks /vs and /vw)", cfg.DisableVoting));
         }

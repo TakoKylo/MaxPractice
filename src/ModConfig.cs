@@ -13,7 +13,7 @@ namespace MaxPractice
         // ============================================================
         // GENERAL
         // ============================================================
-        public int ConfigVersion = 5;
+        public int ConfigVersion = 6;
 
         // ============================================================
         // LIMITS
@@ -23,7 +23,16 @@ namespace MaxPractice
         public int TrafficPerPlayer = 1;
         public float SavePracDurationSeconds = 120f;
         public int MaxPucksBeforeCleanup = 30;
+        // Existing always-on AI goalie behavior — server admin force.
+        // When true, PracticeManager auto-spawns AI goalies during warmup AND keeps them
+        // filling empty goalie slots through every phase.
         public bool GoalieAIPersistDuringGame = false;
+
+        // Whether players may /votegoalies (/vg) to toggle mid-game AI goalie filling.
+        // Independent of GoalieAIPersistDuringGame: a server can enable always-on, voting,
+        // both, or neither. Voting is also blocked by DisableVoting (same as /vs and /vw).
+        // Defaults to false — admins opt in explicitly.
+        public bool EnableGoalieVoting = false;
 
         // When true, the warmup countdown is paused (timer never decrements
         // while Phase == Warmup), so practice-only servers never start games.
@@ -105,7 +114,7 @@ namespace MaxPractice
         private static string _configDir = null;
         private static string _configFile = null;
         
-        private const int CONFIG_VERSION = 5;
+        private const int CONFIG_VERSION = 6;
         private const string VERSION_KEY = "\"ConfigVersion\":";
         
         private static string ConfigDir

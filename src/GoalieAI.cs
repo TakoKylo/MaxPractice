@@ -1,1636 +1,1783 @@
+// GoalieAI.cs - Per-AI-goalie MonoBehaviour that drives PlayerInput each FixedUpdate.
+// Adapted from ToastersRinkSuite reference for Puck B323 + MaxPractice. Behavior matches the
+// reference 1:1 (butterfly/standing decision tree, sad reaction, idle/intermission fidgets,
+// dash overshoot braking, look-RPC replication). The reference's global log filter has been
+// removed — exceptions are wrapped in try/catch at the source instead of being hidden.
+
 using System;
 using System.Collections;
-using System.Collections.Generic;
-using MaxPractice;
 using Unity.Netcode;
 using UnityEngine;
 
-// Simple AI that tracks the puck and moves to intercept
-public class SimpleGoalieAI : MonoBehaviour
+namespace MaxPractice
 {
-    public Player controlledPlayer;
-    public PlayerTeam team;
-    
-    private Vector3 redGoalPos = new Vector3(0f, 0f, -40.23f);
-    private Vector3 blueGoalPos = new Vector3(0f, 0f, 40.23f);
-    private PlayerBody body;
-    private PlayerInput playerInput;
-    private Rigidbody rb;
-    private float updateInterval = 0.033f; // ~30fps updates (was 0.02 = 50fps)
-    private float nextUpdateTime = 0f;
-    private float aggressionRange = 20f; // Large range to react to shots early
-    private int _physicsResetCounter = 0; // Counter for physics reset throttling
-    private float butterflyDistance = 8.0f; // Enter butterfly when puck is close for blocking
-    private float pokeDistance = 3.5f; // Increased poke range
-    private float minPuckSpeed = 2f; // Ignore pucks moving slower than this
-    private float jumpHeight = 1.2f; // Height threshold for jumping to block high shots
-    private float lastPokeTime = 0f;
-    private float pokeCooldown = 0.3f; // Faster poke cooldown
-    private float goalWidth = 1.5f; // Half-width of goal - wider for better angle coverage
-    
-    // Stick tracking - now targets puck directly
-    private Puck trackedPuck = null;
-    private Vector3 lastPuckPos;
-    private Vector3 puckVelocity;
-    
-    // Stick sweeping for poke attacks
-    private float stickSweepTime = 0f;
-    private float stickSweepDuration = 0.15f; // Quick sweep
-    private bool isSweeping = false;
-    private float sweepDirection = 1f; // 1 = right, -1 = left
-    
-    // Dash for lateral movement (crab dash)
-    private float lastDashTime = 0f;
-    private float dashCooldown = 0.25f; // Short cooldown for fast crab dash
-    private float postDashStandDuration = 0.1f; // Very brief stand for crab dash cycle
-    private bool isBrakingOvershoot = false; // Currently braking due to overshoot
-    
-    // Jump for high shots
-    private float lastJumpTime = 0f;
-    private float jumpCooldown = 0.8f; // Time between jumps
-    
-    // Cache state to avoid null reference issues
-    private float noPuckReturnTimer = 0f;
-    private const float NO_PUCK_RETURN_DELAY = 0.3f;
-    private float slowPuckTimer = 0f; // Timer for how long puck has been slow
-    private const float SLOW_PUCK_IGNORE_DELAY = 1.0f; // Ignore puck after 1 second of being slow
-    private float stuckBehindNetTimer = 0f; // Timer for being stuck behind net
-    private const float STUCK_BEHIND_NET_TP_DELAY = 1.5f; // Teleport after 1.5 seconds stuck
-    private bool isRedTeam;
-    private Vector3 goalPos;
-    private bool isInitialized = false;
-    private bool aiEnabled = false;
-    
-    // Auto-reset after saves
-    private float lastSaveTime = 0f;
-    private bool resetScheduled = false;
-    
-    // Dynamic goal positioning
-    private Goal teamGoal;
-    
-    // Idle fidget state
-    private float idleTimer = 0f;
-    private const float IDLE_FIDGET_DELAY = 3.5f;
-    private bool isIdleFidgeting = false;
-    private int currentFidgetType = -1;
-    private float fidgetStartTime = 0f;
-    private float fidgetDuration = 0f;
-    
-    // Sad reaction when scored on
-    private bool isSadReaction = false;
-    private float sadReactionEndTime = 0f;
-    private bool sadLookUp = false;
-    private bool sadFallOver = false;
-    private KeepUpright keepUpright;
-    
-    // Head look replication
-    private static readonly Vector2 lookAngleMin = new Vector2(-25f, -135f);
-    private static readonly Vector2 lookAngleMax = new Vector2(75f, 135f);
-    
-    // Suppress Unity exception logging
-    private static bool logFilterInstalled = false;
-    
-    private void Start()
+    public class GoalieAI : MonoBehaviour
     {
-        try
+        public Player controlledPlayer;
+        public PlayerTeam team;
+
+        // B323 has no RandomGoalSpots — use the same hardcoded positions as the legacy code.
+        private Vector3 redGoalPos = new Vector3(0f, 0f, -40.23f);
+        private Vector3 blueGoalPos = new Vector3(0f, 0f, 40.23f);
+
+        private PlayerBody body;
+        private PlayerInput playerInput;
+        private Rigidbody rb;
+
+        private float updateInterval = 0.033f; // ~30 ticks/s
+        private float nextUpdateTime = 0f;
+        private float aggressionRange = 20f;
+        private int _physicsResetCounter = 0;
+        private float butterflyDistance = 8.0f;
+        private float pokeDistance = 3.5f;
+        private float minPuckSpeed = 2f;
+        private float jumpHeight = 1.2f;
+        private float lastPokeTime = 0f;
+        private float pokeCooldown = 0.3f;
+        private float goalWidth = 1.5f;
+
+        private Puck trackedPuck = null;
+        private Vector3 lastPuckPos;
+        private Vector3 puckVelocity;
+
+        private float stickSweepTime = 0f;
+        private float stickSweepDuration = 0.15f;
+        private bool isSweeping = false;
+        private float sweepDirection = 1f;
+
+        private float lastDashTime = 0f;
+        private float dashCooldown = 0.25f;
+        private float postDashStandDuration = 0.1f;
+        private bool isBrakingOvershoot = false;
+
+        private float lastJumpTime = 0f;
+        private float jumpCooldown = 0.8f;
+
+        private float noPuckReturnTimer = 0f;
+        private const float NO_PUCK_RETURN_DELAY = 0.3f;
+        private float slowPuckTimer = 0f;
+        private const float SLOW_PUCK_IGNORE_DELAY = 1.0f;
+        private float stuckBehindNetTimer = 0f;
+        private const float STUCK_BEHIND_NET_TP_DELAY = 1.5f;
+        private float fallenTimer = 0f;
+        private const float FALLEN_RESPAWN_DELAY = 6.0f;
+
+        private bool isRedTeam;
+        private Vector3 goalPos;
+        private bool isInitialized = false;
+        private bool aiEnabled = false;
+
+        private bool resetScheduled = false;
+
+        private float idleTimer = 0f;
+        private const float IDLE_DELAY = 3.5f;
+        private bool isIdling = false;
+        private float idlePhase = 0f;
+        private int idleBehavior = 0;
+        private float idleBehaviorTimer = 0f;
+        private float idleBehaviorDuration = 0f;
+
+        private bool isSad = false;
+        private float sadTimer = 0f;
+        private const float SAD_DURATION = 4.0f;
+        private bool sadLookUp = false;
+
+        // Celebration when own team scores. Randomly picks between two modes:
+        //   0 = stick raised + waving + jumping
+        //   1 = spinning in place + jumping
+        private bool isCelebrating = false;
+        private float celebrateTimer = 0f;
+        private const float CELEBRATE_DURATION = 4.0f;
+        private float celebratePhase = 0f;
+        private float lastCelebrateJumpTime = 0f;
+        private const float CELEBRATE_JUMP_INTERVAL = 1f;
+        private int celebrateMode = 0;
+
+        // Tracks whether the head is currently turned back to watch a puck behind the net,
+        // so we know to reset LookInput when the puck comes back out front.
+        private bool isLookingAtPuckBehind = false;
+
+        private bool isIntermission = false;
+        private int intermissionBehavior = -1;
+        private float intermissionTimer = 0f;
+        private float intermissionPhase = 0f;
+        private Vector3 intermissionDirection;
+        private float intermissionDashTimer = 0f;
+        private bool intermissionFallen = false;
+
+        private void Start()
         {
-            // Install log filter to suppress null reference spam
-            if (!logFilterInstalled)
-            {
-                Application.logMessageReceived += HandleLog;
-                logFilterInstalled = true;
-            }
-            
-            // Delay initialization to wait for network spawn to complete
-            StartCoroutine(DelayedStart());
+            try { StartCoroutine(DelayedStart()); } catch { }
         }
-        catch (Exception) { }
-    }
-    
-    private static void HandleLog(string logString, string stackTrace, LogType type)
-    {
-        try
+
+        private IEnumerator DelayedStart()
         {
-            // Suppress NullReferenceException logs from GoalieAI
-            if (type == LogType.Exception && logString.Contains("NullReferenceException") && 
-                (stackTrace.Contains("SimpleGoalieAI") || stackTrace.Contains("GoalieAI")))
+            yield return new WaitForSeconds(1.0f);
+
+            int attempts = 0;
+            while (attempts < 20)
             {
-                // Silently ignore
-                return;
+                try { if (controlledPlayer != null && controlledPlayer.IsSpawned) break; } catch { }
+                yield return new WaitForSeconds(0.1f);
+                attempts++;
             }
-        }
-        catch (Exception) { }
-    }
-    
-    private IEnumerator DelayedStart()
-    {
-        // Wait for network object to fully spawn
-        yield return new WaitForSeconds(1.0f);
-        
-        // Keep waiting until player is actually spawned
-        int maxAttempts = 20;
-        int attempts = 0;
-        while (attempts < maxAttempts)
-        {
-            try
-            {
-                if (controlledPlayer != null && controlledPlayer.IsSpawned)
-                    break;
-            }
-            catch (Exception) { }
-            yield return new WaitForSeconds(0.1f);
-            attempts++;
-        }
-        
-        try
-        {
-            if (controlledPlayer == null || !controlledPlayer.IsSpawned)
+
+            bool stillValid;
+            try { stillValid = controlledPlayer != null && controlledPlayer.IsSpawned; }
+            catch { stillValid = false; }
+            if (!stillValid) { Destroy(this); yield break; }
+
+            InitializeComponents();
+            if (body == null || rb == null || playerInput == null || !isInitialized)
             {
                 Destroy(this);
                 yield break;
             }
-        }
-        catch
-        {
-            Destroy(this);
-            yield break;
-        }
-        
-        InitializeComponents();
-        
-        // Verify everything initialized correctly
-        if (body == null || rb == null || playerInput == null || !isInitialized)
-        {
-            try { Destroy(this); } catch (Exception) { }
-            yield break;
-        }
-        
-        // Critical: Test ALL NetworkVariable accesses before enabling AI
-        // This prevents exceptions from being thrown during normal operation
-        yield return new WaitForSeconds(0.5f);
-        
-        bool allInputsReady = false;
-        for (int i = 0; i < 10; i++)
-        {
-            try
-            {
-                // Try to access all the inputs - if any throw, we're not ready
-                if (playerInput.SlideInput != null &&
-                    playerInput.LateralLeftInput != null &&
-                    playerInput.LateralRightInput != null &&
-                    playerInput.DashLeftInput != null &&
-                    playerInput.DashRightInput != null &&
-                    playerInput.StickRaycastOriginAngleInput != null &&
-                    playerInput.JumpInput != null &&
-                    playerInput.LookAngleInput != null &&
-                    playerInput.LookInput != null)
-                {
-                    // Try actually setting a value to make sure ServerValue works
-                    var testValue = playerInput.SlideInput.ServerValue;
-                    allInputsReady = true;
-                    break;
-                }
-            }
-            catch (Exception) { }
-            
-            yield return new WaitForSeconds(0.2f);
-        }
-        
-        if (!allInputsReady)
-        {
-            try { Destroy(this); } catch (Exception) { }
-            yield break;
-        }
-        
-        // Reset physics for AI goalie to counteract CompetitivePuckTweaks modifications
-        // This mod changes drag and physics materials which makes AI goalies slide around
-        ResetGoaliePhysics();
-        
-        // Register for goal events (sad reaction)
-        try
-        {
-            EventManager.AddEventListener("Event_Server_OnPuckEnterGoal", OnGoalScored);
-        }
-        catch (Exception) { }
-        
-        // Initial goal position lookup
-        UpdateGoalPosition();
-        
-        aiEnabled = true;
-    }
-    
-    /// <summary>
-    /// Reset physics settings to vanilla values to counteract CompetitivePuckTweaks mod
-    /// which changes drag/friction causing AI goalies to slide uncontrollably.
-    /// Only applies changes if CompetitivePuckTweaks is detected.
-    /// </summary>
-    private void ResetGoaliePhysics(bool logReset = true)
-    {
-        try
-        {
-            if (rb == null || body == null) return;
-            
-            // Reset rigidbody drag to higher values to counteract CompetitivePuckTweaks (which sets to 0)
-            // Using higher damping (4.0) to make the goalie stop sliding on ice
-            rb.linearDamping = 4.0f;
-            rb.angularDamping = 0.5f;
-            
-            // Reset physics materials on colliders to have proper friction
-            var colliders = body.GetComponentsInChildren<Collider>();
-            foreach (var col in colliders)
-            {
-                if (col != null && col.material != null)
-                {
-                    // Set friction to reasonable values (CompetitivePuckTweaks removes friction)
-                    col.material.dynamicFriction = 0.3f;
-                    col.material.staticFriction = 0.3f;
-                    col.material.frictionCombine = PhysicsMaterialCombine.Average;
-                }
-            }
-            
-            if (logReset) { }
-        }
-        catch (Exception) { }
-    }
-    
-    private void InitializeComponents()
-    {
-        try
-        {
-            if (controlledPlayer != null)
-            {
-                body = controlledPlayer.PlayerBody;
-                playerInput = controlledPlayer.PlayerInput;
-                if (body != null)
-                {
-                    rb = body.GetComponent<Rigidbody>();
-                    keepUpright = body.GetComponent<KeepUpright>();
-                }
-                
-                // Determine team from the public field OR from controlledPlayer's actual team value
-                UpdateTeamAlignment();
-                isInitialized = true;
-            }
-        }
-        catch (Exception) { }
-    }
-    
-    /// <summary>
-    /// Update team alignment - called during init and periodically to ensure consistency
-    /// </summary>
-    private void UpdateTeamAlignment()
-    {
-        try
-        {
-            // First try the public team field that was set at spawn
-            bool newIsRedTeam = team == PlayerTeam.Red;
-            
-            // Also verify against the actual player's team value if available
-            if (controlledPlayer != null)
+
+            // Let NetworkVariables settle.
+            yield return new WaitForSeconds(0.5f);
+
+            bool allInputsReady = false;
+            for (int i = 0; i < 10; i++)
             {
                 try
                 {
-                    PlayerTeam playerTeam = MaxPractice.PracticeHelpers.GetPlayerTeam(controlledPlayer);
-                    bool playerIsRed = playerTeam == PlayerTeam.Red;
-                    
-                    // If there's a mismatch, trust the controlledPlayer's actual value
-                    if (newIsRedTeam != playerIsRed)
+                    if (playerInput.SlideInput != null &&
+                        playerInput.LateralLeftInput != null &&
+                        playerInput.LateralRightInput != null &&
+                        playerInput.DashLeftInput != null &&
+                        playerInput.DashRightInput != null &&
+                        playerInput.StickRaycastOriginAngleInput != null &&
+                        playerInput.JumpInput != null)
                     {
-                        newIsRedTeam = playerIsRed;
-                        team = playerIsRed ? PlayerTeam.Red : PlayerTeam.Blue;
+                        var _ = playerInput.SlideInput.ServerValue;
+                        allInputsReady = true;
+                        break;
                     }
                 }
                 catch { }
+                yield return new WaitForSeconds(0.2f);
             }
-            
-            isRedTeam = newIsRedTeam;
-            goalPos = isRedTeam ? redGoalPos : blueGoalPos;
+
+            if (!allInputsReady) { Destroy(this); yield break; }
+
+            ResetGoaliePhysics();
+            aiEnabled = true;
         }
-        catch (Exception) { }
-    }
-    
-    private void FixedUpdate()
-    {
-        // Don't run until fully initialized
-        if (!aiEnabled) return;
-        
-        // Periodically re-verify team alignment and goal position (every ~2 seconds)
-        if (Time.frameCount % 100 == 0)
+
+        private void ResetGoaliePhysics(bool logReset = true)
         {
-            UpdateTeamAlignment();
-            UpdateGoalPosition();
-        }
-        
-        try
-        {
-            // Comprehensive null checks - abort immediately if anything is wrong
-            if (controlledPlayer == null) { Destroy(this); return; }
-            if (body == null) { aiEnabled = false; return; }
-            if (rb == null) { aiEnabled = false; return; }
-            if (playerInput == null) { aiEnabled = false; return; }
-            if (!MaxPracticePlugin.FakePlayers.Contains(controlledPlayer)) { Destroy(this); return; }
-            
-            // Don't access ANY properties until we verify the network object is valid
-            if (!controlledPlayer.IsSpawned) return;
-            
-            // Apply physics reset periodically (not every frame) to counteract CompetitivePuckTweaks
-            // Only check every 25 frames (~0.5 sec) to reduce overhead
-            _physicsResetCounter++;
-            if (_physicsResetCounter >= 25)
-            {
-                _physicsResetCounter = 0;
-                ResetGoaliePhysics(false);
-            }
-            
-            // On dedicated servers, NetworkVariables need extra validation
-            // Wrap in try/catch because just accessing these properties can throw
             try
             {
-                if (playerInput.SlideInput == null || 
-                    playerInput.LateralLeftInput == null || 
-                    playerInput.LateralRightInput == null ||
-                    playerInput.DashLeftInput == null ||
-                    playerInput.DashRightInput == null ||
-                    playerInput.StickRaycastOriginAngleInput == null)
+                if (rb == null || body == null) return;
+                rb.linearDamping = 4.0f;
+                rb.angularDamping = 0.5f;
+
+                var colliders = body.GetComponentsInChildren<Collider>();
+                foreach (var col in colliders)
                 {
-                    return; // Network variables not ready yet
+                    if (col != null && col.material != null)
+                    {
+                        col.material.dynamicFriction = 0.3f;
+                        col.material.staticFriction = 0.3f;
+                        col.material.frictionCombine = PhysicsMaterialCombine.Average;
+                    }
                 }
             }
-            catch
-            {
-                return; // Network variables not accessible yet
-            }
-            
-            if (body.transform == null) return;
+            catch { }
         }
-        catch
+
+        private void InitializeComponents()
         {
-            return; // Something went wrong in validation
-        }
-        
-        try
-        {
-            
-            // Throttle updates
-            if (Time.time < nextUpdateTime) return;
-            nextUpdateTime = Time.time + updateInterval;
-            
-            Vector3 currentPos;
             try
             {
-                currentPos = body.transform.position;
-                
-                // Give goalie infinite stamina so they can always dash
-                body.Stamina.Value = 1f;
+                if (controlledPlayer == null) return;
+                body = controlledPlayer.PlayerBody;
+                playerInput = controlledPlayer.PlayerInput;
+                if (body != null) rb = body.GetComponent<Rigidbody>();
+                UpdateTeamAlignment();
+                isInitialized = true;
             }
-            catch
+            catch { }
+        }
+
+        private void UpdateTeamAlignment()
+        {
+            try
             {
-                return; // Body was destroyed
+                bool newIsRed = team == PlayerTeam.Red;
+                if (controlledPlayer != null)
+                {
+                    try
+                    {
+                        PlayerTeam pt = controlledPlayer.Team;
+                        bool playerIsRed = pt == PlayerTeam.Red;
+                        if (newIsRed != playerIsRed)
+                        {
+                            newIsRed = playerIsRed;
+                            team = playerIsRed ? PlayerTeam.Red : PlayerTeam.Blue;
+                        }
+                    }
+                    catch { }
+                }
+                isRedTeam = newIsRed;
+                goalPos = isRedTeam ? redGoalPos : blueGoalPos;
             }
-            
-            // Handle sad reaction (blocks normal AI)
-            if (isSadReaction)
+            catch { }
+        }
+
+        private void FixedUpdate()
+        {
+            if (!aiEnabled) return;
+
+            if (Time.frameCount % 100 == 0) UpdateTeamAlignment();
+
+            try
             {
-                UpdateSadReaction();
-                return;
+                if (controlledPlayer == null) { Destroy(this); return; }
+                if (body == null) { aiEnabled = false; return; }
+                if (rb == null) { aiEnabled = false; return; }
+                if (playerInput == null) { aiEnabled = false; return; }
+                if (!GoalieAIManager.IsAIGoalie(controlledPlayer)) { Destroy(this); return; }
+                if (!controlledPlayer.IsSpawned) return;
+
+                _physicsResetCounter++;
+                if (_physicsResetCounter >= 25)
+                {
+                    _physicsResetCounter = 0;
+                    ResetGoaliePhysics(false);
+                }
+
+                try
+                {
+                    if (playerInput.SlideInput == null ||
+                        playerInput.LateralLeftInput == null ||
+                        playerInput.LateralRightInput == null ||
+                        playerInput.DashLeftInput == null ||
+                        playerInput.DashRightInput == null ||
+                        playerInput.StickRaycastOriginAngleInput == null)
+                    {
+                        return;
+                    }
+                }
+                catch { return; }
+
+                if (body.transform == null) return;
             }
-            
-            // Check if goalie is out of position - behind goal line or too far from crease
-            bool behindGoalLine = isRedTeam ? (currentPos.z < goalPos.z - 0.5f) : (currentPos.z > goalPos.z + 0.5f);
-            bool tooFarFromCrease = Vector3.Distance(currentPos, goalPos) > 5f; // Reduced from 8f
-            bool tooFarLateral = Mathf.Abs(currentPos.x) > 4f;
-            bool goalieOutOfPosition = behindGoalLine || tooFarFromCrease || tooFarLateral;
-            
-            // Track time stuck behind net
-            if (behindGoalLine)
+            catch { return; }
+
+            try
             {
-                stuckBehindNetTimer += updateInterval;
-                
-                // If stuck too long, teleport back to crease
-                if (stuckBehindNetTimer >= STUCK_BEHIND_NET_TP_DELAY)
+                if (Time.time < nextUpdateTime) return;
+                nextUpdateTime = Time.time + updateInterval;
+
+                UpdateSadState();
+                // UpdateSadState fully owns inputs during sad (slide, stick, look, move).
+                // Don't ResetInputs() here or the butterfly-crouch SlideInput=true gets toggled
+                // off every frame, causing visible stick/posture jitter.
+                if (isSad) return;
+
+                // Celebration when own team scores — also owns its inputs end-to-end.
+                UpdateCelebrateState();
+                if (isCelebrating) return;
+
+                if (isIntermission)
+                {
+                    try { body.Stamina.Value = 1f; } catch { }
+                    UpdateIntermission();
+                    return;
+                }
+
+                Vector3 currentPos;
+                try
+                {
+                    currentPos = body.transform.position;
+                    body.Stamina.Value = 1f;
+                }
+                catch { return; }
+
+                try
+                {
+                    if (body.HasFallen || body.HasSlipped)
+                    {
+                        fallenTimer += updateInterval;
+                        if (fallenTimer >= FALLEN_RESPAWN_DELAY)
+                        {
+                            Vector3 resetPos = goalPos;
+                            resetPos.z += isRedTeam ? 1.2f : -1.2f;
+                            resetPos.y = 0f;
+                            resetPos.x = 0f;
+
+                            Quaternion resetRot = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
+                            body.transform.position = resetPos;
+                            body.transform.rotation = resetRot;
+
+                            if (rb != null)
+                            {
+                                rb.linearVelocity = Vector3.zero;
+                                rb.angularVelocity = Vector3.zero;
+                            }
+
+                            body.KeepUpright.Balance = 1f;
+                            body.HasFallen = false;
+                            body.HasSlipped = false;
+
+                            ResetInputs();
+                            fallenTimer = 0f;
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        fallenTimer = 0f;
+                    }
+                }
+                catch { }
+
+                bool behindGoalLine = isRedTeam ? (currentPos.z < goalPos.z - 0.5f) : (currentPos.z > goalPos.z + 0.5f);
+                bool tooFarFromCrease = Vector3.Distance(currentPos, goalPos) > 5f;
+                bool tooFarLateral = Mathf.Abs(currentPos.x) > 4f;
+                bool goalieOutOfPosition = behindGoalLine || tooFarFromCrease || tooFarLateral;
+
+                if (behindGoalLine)
+                {
+                    stuckBehindNetTimer += updateInterval;
+                    if (stuckBehindNetTimer >= STUCK_BEHIND_NET_TP_DELAY)
+                    {
+                        try
+                        {
+                            Vector3 resetPos = goalPos;
+                            resetPos.z += isRedTeam ? 1.2f : -1.2f;
+                            resetPos.y = 0f;
+                            resetPos.x = 0f;
+                            body.transform.position = resetPos;
+                            body.transform.rotation = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
+                            if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
+                            ResetInputs();
+                            stuckBehindNetTimer = 0f;
+                        }
+                        catch { }
+                        return;
+                    }
+                }
+                else
+                {
+                    stuckBehindNetTimer = 0f;
+                }
+
+                if (Vector3.Distance(currentPos, goalPos) > 10f)
                 {
                     try
                     {
                         Vector3 resetPos = goalPos;
                         resetPos.z += isRedTeam ? 1.2f : -1.2f;
                         resetPos.y = 0f;
-                        
+                        resetPos.x = 0f;
                         body.transform.position = resetPos;
-                        Quaternion resetRot = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
-                        body.transform.rotation = resetRot;
-                        
-                        if (rb != null)
-                        {
-                            rb.linearVelocity = Vector3.zero;
-                            rb.angularVelocity = Vector3.zero;
-                        }
-                        
+                        body.transform.rotation = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
+                        if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
                         ResetInputs();
-                        stuckBehindNetTimer = 0f;
                     }
-                    catch (Exception) { }
+                    catch { }
                     return;
                 }
-            }
-            else
-            {
-                stuckBehindNetTimer = 0f;
-            }
-            
-            // If goalie is WAY too far out (10+ units), teleport back to crease
-            if (Vector3.Distance(currentPos, goalPos) > 10f)
-            {
+
+                if (goalieOutOfPosition)
+                {
+                    try { playerInput.StopInput.ServerValue = true; } catch { }
+                    ResetInputs();
+                    ReturnToCenter(currentPos, goalPos, isRedTeam);
+                    return;
+                }
+                else
+                {
+                    try { playerInput.StopInput.ServerValue = false; } catch { }
+                }
+
+                Puck puck = GetClosestPuckSafe(goalPos);
+
+                if (puck == null)
+                {
+                    noPuckReturnTimer += updateInterval;
+                    trackedPuck = null;
+
+                    if (noPuckReturnTimer > NO_PUCK_RETURN_DELAY)
+                    {
+                        ResetInputs();
+                        float xBias = 0f;
+                        if (TryLookAtPuckBehindNet(out Vector3 behindPos))
+                        {
+                            // Watching the puck behind the net — skip idle fidgeting and cheat that side.
+                            xBias = ComputeBehindNetCheat(behindPos);
+                        }
+                        else
+                        {
+                            UpdateIdle();
+                            if (!isIdling) ResetStickToCenter();
+                        }
+                        ReturnToCenter(currentPos, goalPos, isRedTeam, xBias);
+                    }
+                    return;
+                }
+
+                noPuckReturnTimer = 0f;
+                // Don't ExitIdle() here — it zeros idleTimer every tick a puck exists, so the
+                // 3.5s idle threshold never accumulates when the puck is just sitting around
+                // (e.g. scattered pucks during warmup). The active-tracking block below calls
+                // ExitIdle() itself when we actually start defending.
+
+                if (trackedPuck != puck)
+                {
+                    trackedPuck = puck;
+                    try { lastPuckPos = puck.transform.position; } catch { }
+                    puckVelocity = Vector3.zero;
+                }
+
+                Vector3 puckPos;
                 try
                 {
-                    Vector3 resetPos = goalPos;
-                    resetPos.z += isRedTeam ? 1.2f : -1.2f;
-                    resetPos.y = 0f;
-                    
-                    body.transform.position = resetPos;
-                    Quaternion resetRot = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
-                    body.transform.rotation = resetRot;
-                    
-                    if (rb != null)
+                    if (puck == null || puck.gameObject == null || puck.transform == null)
                     {
-                        rb.linearVelocity = Vector3.zero;
-                        rb.angularVelocity = Vector3.zero;
+                        ResetInputs();
+                        ResetStickToCenter();
+                        ReturnToCenter(currentPos, goalPos, isRedTeam);
+                        return;
                     }
-                    
-                    ResetInputs();
+                    puckPos = puck.transform.position;
+                    puckVelocity = (puckPos - lastPuckPos) / updateInterval;
+                    lastPuckPos = puckPos;
                 }
-                catch (Exception) { }
-                return;
-            }
-            
-            if (goalieOutOfPosition)
-            {
-                // Use stop input to slow down and return to proper position
-                try { playerInput.StopInput.ServerValue = true; } catch (Exception) { }
-                ResetInputs();
-                ReturnToCenter(currentPos, goalPos, isRedTeam);
-                return;
-            }
-            else
-            {
-                // Reset stop input when in proper position
-                try { playerInput.StopInput.ServerValue = false; } catch (Exception) { }
-            }
-            
-            // Find the closest puck safely
-            Puck puck = GetClosestPuckSafe(goalPos);
-            
-            // Handle case when no puck is found
-            if (puck == null)
-            {
-                noPuckReturnTimer += updateInterval;
-                trackedPuck = null;
-                
-                if (noPuckReturnTimer > NO_PUCK_RETURN_DELAY)
-                {
-                    ResetInputs();
-                    ResetStickToCenter(); // Reset stick when no puck
-                    ReturnToCenter(currentPos, goalPos, isRedTeam);
-                }
-                return;
-            }
-            
-            noPuckReturnTimer = 0f;
-            
-            // Track puck velocity for prediction
-            if (trackedPuck != puck)
-            {
-                trackedPuck = puck;
-                try { lastPuckPos = puck.transform.position; } catch (Exception) { }
-                puckVelocity = Vector3.zero;
-            }
-            
-            // Safe puck position access
-            Vector3 puckPos;
-            try
-            {
-                if (puck == null || puck.gameObject == null || puck.transform == null)
+                catch
                 {
                     ResetInputs();
                     ResetStickToCenter();
                     ReturnToCenter(currentPos, goalPos, isRedTeam);
                     return;
                 }
-                puckPos = puck.transform.position;
-                
-                // Calculate puck velocity for prediction
-                puckVelocity = (puckPos - lastPuckPos) / updateInterval;
-                lastPuckPos = puckPos;
-            }
-            catch
-            {
-                ResetInputs();
-                ResetStickToCenter();
-                ReturnToCenter(currentPos, goalPos, isRedTeam);
-                return;
-            }
-            
-            float puckSpeed = puckVelocity.magnitude;
-            float distToGoal = Vector3.Distance(puckPos, goalPos);
-            float distToPuck = Vector3.Distance(puckPos, currentPos);
-            
-            // Check if puck is heading toward goal - increase reaction range if so
-            bool puckHeadingToGoal = isRedTeam ? (puckVelocity.z < -2f) : (puckVelocity.z > 2f);
-            float effectiveAggressionRange = puckHeadingToGoal ? aggressionRange * 1.5f : aggressionRange;
-            
-            // Check if puck is behind the goal line
-            bool puckBehindGoalLine = isRedTeam ? (puckPos.z < goalPos.z) : (puckPos.z > goalPos.z);
-            
-            // Check if puck is in our zone
-            bool puckInZone = isRedTeam ? (puckPos.z < 0) : (puckPos.z > 0);
-            
-            // Check if puck is in the crease (very close to goal, in front of net)
-            bool puckInCrease = !puckBehindGoalLine && distToGoal < 3f;
-            
-            // Puck behind goal line - always ignore
-            if (puckBehindGoalLine)
-            {
-                ResetInputs();
-                ReturnToCenter(currentPos, goalPos, isRedTeam);
-                return;
-            }
-            
-            // Track slow puck timer - only ignore puck after it's been slow for a while
-            if (puckSpeed < minPuckSpeed && distToPuck > 3f)
-            {
-                slowPuckTimer += updateInterval;
-                if (slowPuckTimer >= SLOW_PUCK_IGNORE_DELAY)
+
+                float puckSpeed = puckVelocity.magnitude;
+                float distToGoal = Vector3.Distance(puckPos, goalPos);
+                float distToPuck = Vector3.Distance(puckPos, currentPos);
+
+                bool puckHeadingToGoal = isRedTeam ? (puckVelocity.z < -2f) : (puckVelocity.z > 2f);
+                float effectiveAggressionRange = puckHeadingToGoal ? aggressionRange * 1.5f : aggressionRange;
+
+                bool puckBehindGoalLine = isRedTeam ? (puckPos.z < goalPos.z) : (puckPos.z > goalPos.z);
+                bool puckInZone = isRedTeam ? (puckPos.z < 0) : (puckPos.z > 0);
+                bool puckInCrease = !puckBehindGoalLine && distToGoal < 3f;
+
+                if (puckBehindGoalLine)
                 {
-                    // Puck has been slow for 1 second - return to center
                     ResetInputs();
-                    ResetStickToCenter();
-                    ReturnToCenter(currentPos, goalPos, isRedTeam);
+                    ReturnToCenter(currentPos, goalPos, isRedTeam, ComputeBehindNetCheat(puckPos));
+                    // Turn the head to watch the puck behind the net (body stays facing forward).
+                    LookAtPuckBehindNet(puckPos, currentPos);
                     return;
                 }
-            }
-            else
-            {
-                // Puck is moving or close - reset timer
-                slowPuckTimer = 0f;
-            }
-            
-            if (puckInZone && distToGoal < effectiveAggressionRange)
-            {
-                // Active play - reset idle state
-                idleTimer = 0f;
-                isIdleFidgeting = false;
-                
-                // Aggressive mode: Move toward puck to intercept
-                Vector3 interceptPos;
-                
-                if (distToPuck < 0.45f)
+
+                if (!puckInZone || distToGoal >= effectiveAggressionRange)
                 {
-                    Vector3 forward = body.transform.forward;
-                    interceptPos = currentPos + forward * 0.15f;
-                    interceptPos.y = currentPos.y;
-                }
-                else
-                {
-                    // Position goalie on the line between puck and goal center
-                    // This is how real goalies play - cut the angle
-                    Vector3 goalCenter = new Vector3(goalPos.x, 0f, goalPos.z);
-                    Vector3 puckToGoal = goalCenter - puckPos;
-                    puckToGoal.y = 0;
-                    
-                    float puckToGoalDist = puckToGoal.magnitude;
-                    if (puckToGoalDist < 0.1f) puckToGoalDist = 0.1f;
-                    
-                    // Calculate how far out to come - stay closer to goal for better coverage
-                    float comeOutDistance = Mathf.Clamp(2.5f - (distToGoal * 0.1f), 1.0f, 2.5f);
-                    
-                    // Calculate the intercept point on the puck-to-goal line
-                    // This is where the goalie should stand to block the shot
-                    float ratio = comeOutDistance / puckToGoalDist;
-                    ratio = Mathf.Clamp01(ratio);
-                    
-                    // Intercept position = goal center + ratio * (puck - goal)
-                    // This puts us on the line between puck and goal
-                    Vector3 interceptOnLine = Vector3.Lerp(goalCenter, puckPos, ratio);
-                    
-                    // Adjust Z to be exactly at our come-out distance
-                    float comeOutZ = isRedTeam ? (goalPos.z + comeOutDistance) : (goalPos.z - comeOutDistance);
-                    
-                    interceptPos = new Vector3(interceptOnLine.x, 0, comeOutZ);
-                }
-                
-                // Clamp X position to stay in front of goal but allow wider coverage
-                interceptPos.x = Mathf.Clamp(interceptPos.x, goalPos.x - goalWidth, goalPos.x + goalWidth);
-                
-                // Clamp Z so goalie stays close to goal line but can come out some
-                float minZ, maxZ;
-                if (isRedTeam)
-                {
-                    minZ = goalPos.z;
-                    maxZ = goalPos.z + 3f; // Reduced from 5 units - stay closer to goal
-                }
-                else
-                {
-                    minZ = goalPos.z - 3f; // Reduced from 5 units - stay closer to goal
-                    maxZ = goalPos.z;
-                }
-                interceptPos.z = Mathf.Clamp(interceptPos.z, minZ, maxZ);
-                
-                // Move toward intercept position
-                Vector3 toIntercept = (interceptPos - currentPos);
-                toIntercept.y = 0;
-                
-                // Enter butterfly if puck is very close
-                if (distToPuck < butterflyDistance)
-                {
-                    float lateralX = toIntercept.x;
-                    float lateralVelocity = 0f;
-                    try { lateralVelocity = rb.linearVelocity.x; } catch (Exception) { }
-                    
-                    // Check if we're overshooting - close to target but moving toward it fast
-                    bool isOvershooting = Mathf.Abs(lateralX) < 1.0f && 
-                                          ((lateralX > 0 && lateralVelocity > 3f) || 
-                                           (lateralX < 0 && lateralVelocity < -3f));
-                    
-                    // Start braking if overshooting
-                    if (isOvershooting)
+                    slowPuckTimer = 0f;
+                    ResetInputs();
+                    float xBias = 0f;
+                    if (TryLookAtPuckBehindNet(out Vector3 behindPos))
                     {
-                        isBrakingOvershoot = true;
+                        xBias = ComputeBehindNetCheat(behindPos);
                     }
-                    
-                    // Stop braking when velocity is near zero
-                    if (isBrakingOvershoot && Mathf.Abs(lateralVelocity) < 0.5f)
+                    else
                     {
-                        isBrakingOvershoot = false;
+                        UpdateIdle();
+                        if (!isIdling) ResetStickToCenter();
                     }
-                    
-                    // Check if we're in post-dash stand period
-                    bool isPostDashStand = (Time.time - lastDashTime) < postDashStandDuration;
-                    
-                    // Check current slide state
-                    bool isSliding = false;
-                    try { isSliding = body.IsSliding.Value; } catch (Exception) { }
-                    
-                    bool needsCrabDash = Mathf.Abs(lateralX) > 0.3f;
-                    
-                    // Schedule reset 2 seconds after making a save
-                    if (!resetScheduled && distToPuck < 2.0f)
+                    ReturnToCenter(currentPos, goalPos, isRedTeam, xBias);
+                    return;
+                }
+
+                if (puckSpeed < minPuckSpeed && distToPuck > 3f)
+                {
+                    slowPuckTimer += updateInterval;
+                    if (slowPuckTimer >= SLOW_PUCK_IGNORE_DELAY)
                     {
-                        lastSaveTime = Time.time;
-                        resetScheduled = true;
-                        StartCoroutine(ResetAfterSave());
-                    }
-                    
-                    // Reset stop input by default
-                    try { playerInput.StopInput.ServerValue = false; } catch (Exception) { }
-                    
-                    if (isBrakingOvershoot)
-                    {
-                        // Over-correction - stay crouched but use stop to brake
-                        try { playerInput.SlideInput.ServerValue = true; } catch (Exception) { }
-                        try { playerInput.StopInput.ServerValue = true; } catch (Exception) { }
-                    }
-                    else if (needsCrabDash)
-                    {
-                        // Crab dash cycle: crouch -> dash -> stand+stop briefly -> crouch -> repeat
-                        if (isPostDashStand)
+                        ResetInputs();
+                        float xBias = 0f;
+                        if (TryLookAtPuckBehindNet(out Vector3 behindPos))
                         {
-                            // Stand phase of crab dash - brief stand with stop
-                            try { playerInput.SlideInput.ServerValue = false; } catch (Exception) { }
-                            try { playerInput.StopInput.ServerValue = true; } catch (Exception) { }
+                            xBias = ComputeBehindNetCheat(behindPos);
                         }
                         else
                         {
-                            // Crouch phase - ready to dash
-                            try { playerInput.SlideInput.ServerValue = true; } catch (Exception) { return; }
-                            try { playerInput.StopInput.ServerValue = false; } catch (Exception) { }
-                            
-                            if (isSliding && Time.time - lastDashTime > dashCooldown)
+                            UpdateIdle();
+                            if (!isIdling) ResetStickToCenter();
+                        }
+                        ReturnToCenter(currentPos, goalPos, isRedTeam, xBias);
+                        return;
+                    }
+                }
+                else
+                {
+                    slowPuckTimer = 0f;
+                }
+
+                if (puckInZone && distToGoal < effectiveAggressionRange)
+                {
+                    ExitIdle();
+                    StopLookingAtPuckBehind(); // active threat in front — eyes forward
+                    Vector3 interceptPos;
+
+                    if (distToPuck < 0.45f)
+                    {
+                        Vector3 forward = body.transform.forward;
+                        interceptPos = currentPos + forward * 0.15f;
+                        interceptPos.y = currentPos.y;
+                    }
+                    else
+                    {
+                        Vector3 goalCenter = new Vector3(0f, 0f, goalPos.z);
+                        Vector3 puckToGoal = goalCenter - puckPos;
+                        puckToGoal.y = 0;
+                        float puckToGoalDist = puckToGoal.magnitude;
+                        if (puckToGoalDist < 0.1f) puckToGoalDist = 0.1f;
+
+                        float comeOutDistance = Mathf.Clamp(2.5f - (distToGoal * 0.1f), 1.0f, 2.5f);
+                        float ratio = Mathf.Clamp01(comeOutDistance / puckToGoalDist);
+                        Vector3 interceptOnLine = Vector3.Lerp(goalCenter, puckPos, ratio);
+                        float comeOutZ = isRedTeam ? (goalPos.z + comeOutDistance) : (goalPos.z - comeOutDistance);
+                        interceptPos = new Vector3(interceptOnLine.x, 0, comeOutZ);
+                    }
+
+                    interceptPos.x = Mathf.Clamp(interceptPos.x, -goalWidth, goalWidth);
+
+                    float minZ, maxZ;
+                    if (isRedTeam) { minZ = goalPos.z; maxZ = goalPos.z + 3f; }
+                    else { minZ = goalPos.z - 3f; maxZ = goalPos.z; }
+                    interceptPos.z = Mathf.Clamp(interceptPos.z, minZ, maxZ);
+
+                    Vector3 toIntercept = interceptPos - currentPos;
+                    toIntercept.y = 0;
+
+                    if (distToPuck < butterflyDistance)
+                    {
+                        float lateralX = toIntercept.x;
+                        float lateralVelocity = 0f;
+                        try { lateralVelocity = rb.linearVelocity.x; } catch { }
+
+                        bool isOvershooting = Mathf.Abs(lateralX) < 1.0f &&
+                                              ((lateralX > 0 && lateralVelocity > 3f) ||
+                                               (lateralX < 0 && lateralVelocity < -3f));
+
+                        if (isOvershooting) isBrakingOvershoot = true;
+                        if (isBrakingOvershoot && Mathf.Abs(lateralVelocity) < 0.5f) isBrakingOvershoot = false;
+
+                        bool isPostDashStand = (Time.time - lastDashTime) < postDashStandDuration;
+                        bool isSliding = false;
+                        try { isSliding = body.IsSliding.Value; } catch { }
+                        bool needsCrabDash = Mathf.Abs(lateralX) > 0.3f;
+
+                        if (!resetScheduled && distToPuck < 2.0f)
+                        {
+                            resetScheduled = true;
+                            StartCoroutine(ResetAfterSave());
+                        }
+
+                        try { playerInput.StopInput.ServerValue = false; } catch { }
+
+                        if (isBrakingOvershoot)
+                        {
+                            try { playerInput.SlideInput.ServerValue = true; } catch { }
+                            try { playerInput.StopInput.ServerValue = true; } catch { }
+                        }
+                        else if (needsCrabDash)
+                        {
+                            if (isPostDashStand)
                             {
-                                try
-                                {
-                                    // Blue goalie faces backward, so dash directions are inverted for them
-                                    bool dashRight = isRedTeam ? (lateralX > 0) : (lateralX < 0);
-                                    if (dashRight)
-                                    {
-                                        body.DashRight();
-                                    }
-                                    else
-                                    {
-                                        body.DashLeft();
-                                    }
-                                    lastDashTime = Time.time;
-                                }
-                                catch (Exception) { }
+                                try { playerInput.SlideInput.ServerValue = false; } catch { }
+                                try { playerInput.StopInput.ServerValue = true; } catch { }
                             }
+                            else
+                            {
+                                try { playerInput.SlideInput.ServerValue = true; } catch { return; }
+                                try { playerInput.StopInput.ServerValue = false; } catch { }
+
+                                if (isSliding && Time.time - lastDashTime > dashCooldown)
+                                {
+                                    try
+                                    {
+                                        bool dashRight = isRedTeam ? (lateralX > 0) : (lateralX < 0);
+                                        if (dashRight) body.DashRight(); else body.DashLeft();
+                                        lastDashTime = Time.time;
+                                    }
+                                    catch { }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            try { playerInput.SlideInput.ServerValue = true; } catch { }
+                            if (Mathf.Abs(lateralVelocity) > 0.5f)
+                                try { playerInput.StopInput.ServerValue = true; } catch { }
                         }
                     }
                     else
                     {
-                        // In position - stay in butterfly, use stop if still moving
-                        try { playerInput.SlideInput.ServerValue = true; } catch (Exception) { }
-                        if (Mathf.Abs(lateralVelocity) > 0.5f)
+                        // Standing mode
+                        float lateralX = toIntercept.x;
+                        float lateralVelocity = 0f;
+                        try { lateralVelocity = rb.linearVelocity.x; } catch { }
+
+                        try
                         {
-                            try { playerInput.StopInput.ServerValue = true; } catch (Exception) { }
+                            playerInput.LateralLeftInput.ServerValue = false;
+                            playerInput.LateralRightInput.ServerValue = false;
                         }
-                    }
-                    
-                    // In butterfly, we can't really move forward/back so just stay put
-                }
-                else
-                {
-                    // Standing mode
-                    float lateralX = toIntercept.x;
-                    float lateralVelocity = 0f;
-                    try { lateralVelocity = rb.linearVelocity.x; } catch (Exception) { }
-                    
-                    // Reset lateral inputs
-                    try
-                    {
-                        playerInput.LateralLeftInput.ServerValue = false;
-                        playerInput.LateralRightInput.ServerValue = false;
-                    }
-                    catch (Exception) { return; }
-                    
-                    // Check if we're overshooting - close to target but moving toward it fast
-                    bool isOvershooting = Mathf.Abs(lateralX) < 1.5f && 
-                                          ((lateralX > 0 && lateralVelocity > 3f) || 
-                                           (lateralX < 0 && lateralVelocity < -3f));
-                    
-                    // Start braking if overshooting
-                    if (isOvershooting)
-                    {
-                        isBrakingOvershoot = true;
-                    }
-                    
-                    // Stop braking when velocity is near zero
-                    if (isBrakingOvershoot && Mathf.Abs(lateralVelocity) < 0.5f)
-                    {
-                        isBrakingOvershoot = false;
-                    }
-                    
-                    // Check if we're in post-dash stand period (brief stand to control momentum)
-                    bool isPostDashStand = (Time.time - lastDashTime) < postDashStandDuration;
-                    
-                    // Only use crab dash for lateral movement
-                    bool needsCrabDash = Mathf.Abs(lateralX) > 1.0f;
-                    
-                    // Check current slide state
-                    bool isSliding = false;
-                    try { isSliding = body.IsSliding.Value; } catch (Exception) { }
-                    
-                    // Reset stop input by default
-                    try { playerInput.StopInput.ServerValue = false; } catch (Exception) { }
-                    
-                    if (isBrakingOvershoot)
-                    {
-                        // Stand until velocity is 0 to stop lateral movement
-                        try { playerInput.SlideInput.ServerValue = false; } catch (Exception) { }
-                        // Use stop action to brake faster
-                        try { playerInput.StopInput.ServerValue = true; } catch (Exception) { }
-                    }
-                    else if (needsCrabDash)
-                    {
-                        // Crab dash cycle: crouch -> dash -> stand+stop -> crouch -> repeat
-                        if (isPostDashStand)
+                        catch { return; }
+
+                        bool isOvershooting = Mathf.Abs(lateralX) < 1.5f &&
+                                              ((lateralX > 0 && lateralVelocity > 3f) ||
+                                               (lateralX < 0 && lateralVelocity < -3f));
+
+                        if (isOvershooting) isBrakingOvershoot = true;
+                        if (isBrakingOvershoot && Mathf.Abs(lateralVelocity) < 0.5f) isBrakingOvershoot = false;
+
+                        bool isPostDashStand = (Time.time - lastDashTime) < postDashStandDuration;
+                        bool needsCrabDash = Mathf.Abs(lateralX) > 1.0f;
+                        bool isSliding = false;
+                        try { isSliding = body.IsSliding.Value; } catch { }
+
+                        try { playerInput.StopInput.ServerValue = false; } catch { }
+
+                        if (isBrakingOvershoot)
                         {
-                            // Stand phase of crab dash - use stop to control momentum
-                            try { playerInput.SlideInput.ServerValue = false; } catch (Exception) { }
-                            try { playerInput.StopInput.ServerValue = true; } catch (Exception) { }
+                            try { playerInput.SlideInput.ServerValue = false; } catch { }
+                            try { playerInput.StopInput.ServerValue = true; } catch { }
+                        }
+                        else if (needsCrabDash)
+                        {
+                            if (isPostDashStand)
+                            {
+                                try { playerInput.SlideInput.ServerValue = false; } catch { }
+                                try { playerInput.StopInput.ServerValue = true; } catch { }
+                            }
+                            else
+                            {
+                                try { playerInput.SlideInput.ServerValue = true; } catch { return; }
+                                try { playerInput.StopInput.ServerValue = false; } catch { }
+
+                                if (isSliding && Time.time - lastDashTime > dashCooldown)
+                                {
+                                    try
+                                    {
+                                        bool dashRight = isRedTeam ? (lateralX > 0) : (lateralX < 0);
+                                        if (dashRight) body.DashRight(); else body.DashLeft();
+                                        lastDashTime = Time.time;
+                                    }
+                                    catch { }
+                                }
+                            }
+                        }
+                        else if (isPostDashStand)
+                        {
+                            try { playerInput.SlideInput.ServerValue = false; } catch { }
+                            try { playerInput.StopInput.ServerValue = true; } catch { }
                         }
                         else
                         {
-                            // Crouch phase - ready to dash
-                            try { playerInput.SlideInput.ServerValue = true; } catch (Exception) { return; }
-                            try { playerInput.StopInput.ServerValue = false; } catch (Exception) { }
-                            
-                            if (isSliding && Time.time - lastDashTime > dashCooldown)
-                            {
-                                try
-                                {
-                                    // Blue goalie faces backward, so dash directions are inverted for them
-                                    bool dashRight = isRedTeam ? (lateralX > 0) : (lateralX < 0);
-                                    if (dashRight)
-                                    {
-                                        body.DashRight();
-                                    }
-                                    else
-                                    {
-                                        body.DashLeft();
-                                    }
-                                    lastDashTime = Time.time;
-                                }
-                                catch (Exception) { }
-                            }
+                            try { playerInput.SlideInput.ServerValue = false; } catch { }
+                            if (Mathf.Abs(lateralVelocity) > 0.5f)
+                                try { playerInput.StopInput.ServerValue = true; } catch { }
                         }
-                    }
-                    else if (isPostDashStand)
-                    {
-                        // Just finished moving - stand to stop sooner
-                        try { playerInput.SlideInput.ServerValue = false; } catch (Exception) { }
-                        // Use stop action to brake
-                        try { playerInput.StopInput.ServerValue = true; } catch (Exception) { }
-                    }
-                    else
-                    {
-                        // In position - stand, use stop if still moving
-                        try { playerInput.SlideInput.ServerValue = false; } catch (Exception) { }
-                        if (Mathf.Abs(lateralVelocity) > 0.5f)
+
+                        bool currentlySliding = false;
+                        try { currentlySliding = body.IsSliding.Value; } catch { }
+
+                        if (!currentlySliding && Mathf.Abs(toIntercept.z) > 0.1f)
                         {
-                            try { playerInput.StopInput.ServerValue = true; } catch (Exception) { }
+                            try
+                            {
+                                if (toIntercept.z > 0.1f)
+                                    playerInput.MoveInput.ServerValue = isRedTeam ? new Vector2(0f, 1f) : new Vector2(0f, -1f);
+                                else if (toIntercept.z < -0.1f)
+                                    playerInput.MoveInput.ServerValue = isRedTeam ? new Vector2(0f, -1f) : new Vector2(0f, 1f);
+                            }
+                            catch { return; }
+                        }
+                        else if (!currentlySliding)
+                        {
+                            try { playerInput.MoveInput.ServerValue = Vector2.zero; } catch { }
                         }
                     }
-                    
-                    // Check current slide state for movement
-                    bool currentlySliding = false;
-                    try { currentlySliding = body.IsSliding.Value; } catch (Exception) { }
-                    
-                    // Forward/back movement when standing (only if not sliding)
-                    if (!currentlySliding && Mathf.Abs(toIntercept.z) > 0.1f)
+
+                    if (isSweeping)
+                        UpdateStickSweep(puckPos, currentPos);
+                    else
+                        UpdateStickToTrackPuck(puckPos, currentPos);
+
+                    float effectivePokeDistance = pokeDistance + (puckSpeed * 0.1f);
+                    if (distToPuck < effectivePokeDistance && Time.time - lastPokeTime > pokeCooldown)
+                    {
+                        if (IsPuckDangerous(puckPos))
+                        {
+                            // Opposing player is right on the puck — sweep it away from danger.
+                            TryPoke(puckPos, currentPos);
+                            lastPokeTime = Time.time;
+                        }
+                        else if (distToPuck < 1.5f && puckSpeed < 4f)
+                        {
+                            // Safe AND puck is essentially under control — outlet pass to a teammate.
+                            TryPassPuck(puckPos, currentPos);
+                            lastPokeTime = Time.time;
+                        }
+                        // Otherwise: don't sweep. Let UpdateStickToTrackPuck keep the stick
+                        // pointed at the incoming puck so the goalie intercepts on contact
+                        // instead of flailing at every long shot.
+                    }
+
+                    if (puckPos.y > jumpHeight && distToPuck < 6f && puckHeadingToGoal &&
+                        Time.time - lastJumpTime > jumpCooldown)
                     {
                         try
                         {
-                            if (toIntercept.z > 0.1f)
+                            playerInput.SlideInput.ServerValue = false;
+                            bool isSliding = false;
+                            try { isSliding = body.IsSliding.Value; } catch { }
+                            if (!isSliding)
                             {
-                                // Need to move forward (toward center ice)
-                                if (isRedTeam)
-                                {
-                                    playerInput.MoveInput.ServerValue = new Vector2(0f, 1f);
-                                }
-                                else
-                                {
-                                    playerInput.MoveInput.ServerValue = new Vector2(0f, -1f);
-                                }
-                            }
-                            else if (toIntercept.z < -0.1f)
-                            {
-                                // Need to move backward (toward own goal)
-                                if (isRedTeam)
-                                {
-                                    playerInput.MoveInput.ServerValue = new Vector2(0f, -1f);
-                                }
-                                else
-                                {
-                                    playerInput.MoveInput.ServerValue = new Vector2(0f, 1f);
-                                }
+                                playerInput.JumpInput.ServerValue += 1;
+                                lastJumpTime = Time.time;
                             }
                         }
-                        catch (Exception) { return; }
+                        catch { }
                     }
-                    else if (!currentlySliding)
+
+                    // Face toward puck (in-crease) or angle toward puck from the goal line.
+                    try
                     {
-                        try { playerInput.MoveInput.ServerValue = Vector2.zero; } catch (Exception) { }
+                        Vector3 toPuck = puckPos - currentPos;
+                        toPuck.y = 0;
+
+                        if (puckInCrease && toPuck.sqrMagnitude > 0.01f)
+                        {
+                            Quaternion targetRot = Quaternion.LookRotation(toPuck);
+                            body.transform.rotation = Quaternion.Slerp(body.transform.rotation, targetRot, 0.08f);
+                        }
+                        else if (toPuck.sqrMagnitude > 0.01f)
+                        {
+                            Vector3 forwardDir = isRedTeam ? Vector3.forward : Vector3.back;
+                            Vector3 toPuckFromGoal = puckPos - goalPos;
+                            toPuckFromGoal.y = 0;
+                            float angleTowardPuck = Vector3.SignedAngle(forwardDir, toPuckFromGoal.normalized, Vector3.up);
+                            angleTowardPuck = Mathf.Clamp(angleTowardPuck, -45f, 45f);
+                            Quaternion targetRot = Quaternion.Euler(0, isRedTeam ? angleTowardPuck : (180f + angleTowardPuck), 0);
+                            body.transform.rotation = Quaternion.Slerp(body.transform.rotation, targetRot, 0.05f);
+                        }
                     }
-                }
-                
-                // Update stick position to track puck height and direction
-                if (isSweeping)
-                {
-                    UpdateStickSweep(puckPos, currentPos);
+                    catch { }
                 }
                 else
                 {
-                    UpdateStickToTrackPuck(puckPos, currentPos);
-                }
-                
-                // Replicate head look toward puck
-                UpdateHeadLook(puckPos, currentPos);
-                
-                // Poke with stick if puck is very close or coming in fast
-                float effectivePokeDistance = pokeDistance + (puckSpeed * 0.1f); // Extend range for fast pucks
-                if (distToPuck < effectivePokeDistance && Time.time - lastPokeTime > pokeCooldown)
-                {
-                    TryPoke(puckPos, currentPos);
-                    lastPokeTime = Time.time;
-                }
-                
-                // Jump if puck is too high to block with stick and heading toward us
-                // Goalie must be standing to jump!
-                if (puckPos.y > jumpHeight && distToPuck < 6f && puckHeadingToGoal && 
-                    Time.time - lastJumpTime > jumpCooldown)
-                {
-                    try
+                    ResetInputs();
+                    float xBias = 0f;
+                    if (TryLookAtPuckBehindNet(out Vector3 behindPos))
                     {
-                        // Stand up first - can't jump while crouched
-                        playerInput.SlideInput.ServerValue = false;
-                        
-                        // Check if we're actually standing (not sliding)
-                        bool isSliding = false;
-                        try { isSliding = body.IsSliding.Value; } catch (Exception) { }
-                        
-                        if (!isSliding)
-                        {
-                            // Trigger jump by incrementing JumpInput ServerValue
-                            playerInput.JumpInput.ServerValue += 1;
-                            lastJumpTime = Time.time;
-                        }
+                        xBias = ComputeBehindNetCheat(behindPos);
                     }
-                    catch (Exception) { }
-                }
-                
-                // Face mostly forward (based on spawn/team), only slight adjustment toward puck
-                // UNLESS puck is in crease - then turn freely to track it
-                try
-                {
-                    Vector3 toPuck = puckPos - currentPos;
-                    toPuck.y = 0;
-                    
-                    if (puckInCrease && toPuck.sqrMagnitude > 0.01f)
+                    else
                     {
-                        // Puck in crease - allow full rotation to face the puck!
-                        Quaternion targetRot = Quaternion.LookRotation(toPuck);
-                        body.transform.rotation = Quaternion.Slerp(body.transform.rotation, targetRot, 0.08f);
+                        UpdateIdle();
+                        if (!isIdling) ResetStickToCenter();
                     }
-                    else if (toPuck.sqrMagnitude > 0.01f)
-                    {
-                        // Normal play - clamp rotation to mostly forward
-                        Vector3 forwardDir = isRedTeam ? Vector3.forward : Vector3.back;
-                        Vector3 toPuckFromGoal = puckPos - goalPos;
-                        toPuckFromGoal.y = 0;
-                        
-                        float angleTowardPuck = Vector3.SignedAngle(forwardDir, toPuckFromGoal.normalized, Vector3.up);
-                        // Clamp to 45 degrees max turn from forward
-                        angleTowardPuck = Mathf.Clamp(angleTowardPuck, -45f, 45f);
-                        
-                        Quaternion targetRot = Quaternion.Euler(0, isRedTeam ? angleTowardPuck : (180f + angleTowardPuck), 0);
-                        body.transform.rotation = Quaternion.Slerp(body.transform.rotation, targetRot, 0.05f);
-                    }
-                }
-                catch (Exception) { }
-            }
-            else
-            {
-                // Return to center position
-                ResetInputs();
-                ResetStickToCenter(); // Reset stick when returning to center
-                ReturnToCenter(currentPos, goalPos, isRedTeam);
-            }
-        }
-        catch
-        {
-            // Silently ignore all exceptions during AI update
-        }
-    }
-    
-    private void ResetInputs()
-    {
-        if (playerInput == null) return;
-        
-        try
-        {
-            playerInput.SlideInput.ServerValue = false;
-            playerInput.LateralLeftInput.ServerValue = false;
-            playerInput.LateralRightInput.ServerValue = false;
-            playerInput.DashLeftInput.ServerValue = 0;
-            playerInput.DashRightInput.ServerValue = 0;
-            playerInput.MoveInput.ServerValue = Vector2.zero;
-        }
-        catch (Exception) { }
-    }
-    
-    private void TryPoke(Vector3 puckPos, Vector3 currentPos)
-    {
-        if (playerInput == null || body == null) return;
-        
-        try
-        {
-            Vector3 toPuck = puckPos - currentPos;
-            float angle = Vector3.SignedAngle(body.transform.forward, toPuck, Vector3.up);
-            
-            // Start a sweep attack toward the puck
-            if (!isSweeping)
-            {
-                isSweeping = true;
-                stickSweepTime = 0f;
-                // Sweep in the direction of the puck
-                sweepDirection = angle > 0 ? 1f : -1f;
-            }
-            // Note: We don't use ExtendInput - that extends leg pads, not stick
-        }
-        catch (Exception) { }
-    }
-    
-    // Sweeping attack motion that targets the puck
-    private void UpdateStickSweep(Vector3 puckPos, Vector3 currentPos)
-    {
-        if (!isSweeping || playerInput == null || body == null) return;
-        
-        try
-        {
-            stickSweepTime += Time.fixedDeltaTime;
-            float progress = stickSweepTime / stickSweepDuration;
-            
-            // Sweep motion: start wide, sweep through puck position
-            // Use sine wave for smooth acceleration/deceleration
-            float sweepProgress = Mathf.Sin(progress * Mathf.PI); // 0 -> 1 -> 0
-            float sweepAngle = sweepDirection * (45f - sweepProgress * 90f); // Start at 45, sweep to -45
-            
-            // Calculate vertical angle based on puck height
-            float puckHeight = puckPos.y;
-            float verticalAngle;
-            if (puckHeight < 0.1f)
-                verticalAngle = 35f;
-            else if (puckHeight > 1.5f)
-                verticalAngle = -20f;
-            else
-                verticalAngle = Mathf.Lerp(35f, -20f, puckHeight / 1.5f);
-            
-            playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(verticalAngle, sweepAngle);
-            
-            if (progress >= 1f)
-            {
-                isSweeping = false;
-            }
-        }
-        catch (Exception) { }
-    }
-    
-    // New method: Track puck with stick blade
-    private void UpdateStickToTrackPuck(Vector3 puckPos, Vector3 currentPos)
-    {
-        if (playerInput == null || body == null) return;
-        
-        try
-        {
-            Vector3 toPuck = puckPos - currentPos;
-            
-            // Calculate horizontal angle to puck (stick angle Y)
-            float horizontalAngle = Vector3.SignedAngle(body.transform.forward, new Vector3(toPuck.x, 0, toPuck.z), Vector3.up);
-            // Allow full 90 degrees of stick motion each way
-            horizontalAngle = Mathf.Clamp(horizontalAngle, -90f, 90f);
-            
-            // Calculate vertical angle based on puck height (stick angle X)
-            // Higher puck = lower X value (stick goes up), lower puck = higher X value
-            float puckHeight = puckPos.y;
-            float verticalAngle;
-            
-            if (puckHeight < 0.1f)
-            {
-                // Puck on ice - stick down
-                verticalAngle = 35f;
-            }
-            else if (puckHeight > 1.5f)
-            {
-                // Puck high - stick up
-                verticalAngle = -20f;
-            }
-            else
-            {
-                // Interpolate based on height
-                verticalAngle = Mathf.Lerp(35f, -20f, puckHeight / 1.5f);
-            }
-            
-            playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(verticalAngle, horizontalAngle);
-        }
-        catch (Exception) { }
-    }
-    
-    // Reset stick to center position when not tracking
-    private void ResetStickToCenter()
-    {
-        if (playerInput == null) return;
-        try 
-        { 
-            playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(30f, 0f); 
-        } 
-        catch (Exception) { }
-    }
-    
-    /// <summary>
-    /// Update goal position dynamically from Goal transform.
-    /// Supports CompAdjustments goal scaling/repositioning.
-    /// </summary>
-    private void UpdateGoalPosition()
-    {
-        try
-        {
-            var goals = UnityEngine.Object.FindObjectsByType<Goal>(FindObjectsSortMode.None);
-            foreach (var goal in goals)
-            {
-                if (goal == null) continue;
-                // Determine team from position (red goal at z < 0, blue at z > 0)
-                bool isGoalRed = goal.transform.position.z < 0;
-                if (isGoalRed == isRedTeam)
-                {
-                    teamGoal = goal;
-                    Vector3 pos = goal.transform.position;
-                    pos.y = 0f;
-                    goalPos = pos;
-                    return;
+                    ReturnToCenter(currentPos, goalPos, isRedTeam, xBias);
                 }
             }
-        }
-        catch (Exception) { }
-    }
-    
-    /// <summary>
-    /// Broadcast look angle to all clients via Server RPC so head rotation is visible.
-    /// NetworkedInput.ServerValue is a plain field, NOT a NetworkVariable,
-    /// so setting it only affects the server. The Server_*InputRpc broadcasts to clients.
-    /// </summary>
-    private void BroadcastLookAngle(float pitch, float yaw)
-    {
-        if (playerInput == null) return;
-        try
-        {
-            pitch = Mathf.Clamp(pitch, lookAngleMin.x, lookAngleMax.x);
-            yaw = Mathf.Clamp(yaw, lookAngleMin.y, lookAngleMax.y);
-            playerInput.LookAngleInput.ServerValue = new Vector2(pitch, yaw);
-            short cx = NetworkingUtils.CompressFloatToShort(pitch, lookAngleMin.x, lookAngleMax.x);
-            short cy = NetworkingUtils.CompressFloatToShort(yaw, lookAngleMin.y, lookAngleMax.y);
-            playerInput.Server_LookAngleInputRpc(cx, cy, playerInput.RpcTarget.Everyone);
-        }
-        catch (Exception) { }
-    }
-    
-    private void BroadcastLookInput(bool value)
-    {
-        if (playerInput == null) return;
-        try
-        {
-            playerInput.LookInput.ServerValue = value;
-            playerInput.Server_LookInputRpc(value, playerInput.RpcTarget.Everyone);
-        }
-        catch (Exception) { }
-    }
-    
-    /// <summary>
-    /// Replicate head look direction toward a target so other players see the goalie looking at the puck.
-    /// </summary>
-    private void UpdateHeadLook(Vector3 targetPos, Vector3 currentPos)
-    {
-        if (playerInput == null || body == null) return;
-        try
-        {
-            Vector3 toTarget = targetPos - currentPos;
-            
-            // Horizontal angle relative to body facing
-            Vector3 forward = body.transform.forward;
-            float yawAngle = Vector3.SignedAngle(forward, new Vector3(toTarget.x, 0, toTarget.z), Vector3.up);
-            yawAngle = Mathf.Clamp(yawAngle, lookAngleMin.y, lookAngleMax.y);
-            
-            // Vertical angle - positive = look down, negative = look up
-            float horizontalDist = new Vector2(toTarget.x, toTarget.z).magnitude;
-            float pitchAngle = 25f; // default slightly down
-            if (horizontalDist > 0.1f)
+            catch
             {
-                pitchAngle = -Mathf.Atan2(toTarget.y, horizontalDist) * Mathf.Rad2Deg;
-                pitchAngle = Mathf.Clamp(pitchAngle, lookAngleMin.x, lookAngleMax.x);
+                // Swallow per-tick exceptions; we want the AI to recover rather than spam logs.
             }
-            
-            BroadcastLookInput(true);
-            BroadcastLookAngle(pitchAngle, yawAngle);
         }
-        catch (Exception) { }
-    }
-    
-    /// <summary>
-    /// Handle sad reaction animation when scored on.
-    /// </summary>
-    private void UpdateSadReaction()
-    {
-        if (Time.time >= sadReactionEndTime)
+
+        private void ResetInputs()
         {
-            // Sad reaction over - restore
-            isSadReaction = false;
-            if (keepUpright != null) keepUpright.Balance = 1f;
-            try { playerInput.SlideInput.ServerValue = false; } catch { }
-            try { playerInput.StopInput.ServerValue = false; } catch { }
-            BroadcastLookInput(false);
-            BroadcastLookAngle(25f, 0f);
-            
-            // Reset position to crease
+            if (playerInput == null) return;
             try
             {
-                Vector3 resetPos = goalPos;
-                resetPos.z += isRedTeam ? 1.2f : -1.2f;
-                resetPos.y = 0f;
-                body.transform.position = resetPos;
-                body.transform.rotation = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
-                if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
+                playerInput.SlideInput.ServerValue = false;
+                playerInput.LateralLeftInput.ServerValue = false;
+                playerInput.LateralRightInput.ServerValue = false;
+                playerInput.DashLeftInput.ServerValue = 0;
+                playerInput.DashRightInput.ServerValue = 0;
+                playerInput.MoveInput.ServerValue = Vector2.zero;
             }
             catch { }
         }
-        else
+
+        private void TryPoke(Vector3 puckPos, Vector3 currentPos)
         {
-            // During sad reaction: butterfly + look down/up + don't move
-            try { playerInput.SlideInput.ServerValue = true; } catch { }
-            try { playerInput.StopInput.ServerValue = true; } catch { }
-            try { playerInput.MoveInput.ServerValue = Vector2.zero; } catch { }
-            BroadcastLookInput(true);
-            float lookX = sadLookUp ? -20f : 60f;
-            BroadcastLookAngle(lookX, 0f);
-        }
-    }
-    
-    /// <summary>
-    /// Event handler for puck entering goal. Triggers sad reaction if scored on.
-    /// </summary>
-    private void OnGoalScored(Dictionary<string, object> message)
-    {
-        try
-        {
-            if (!aiEnabled || controlledPlayer == null) return;
-            if (message == null) return;
-            
-            // Only trigger sad reactions during actual gameplay, not warmup
-            var gm = NetworkBehaviourSingleton<GameManager>.Instance;
-            if (gm == null) return;
-            GamePhase phase = gm.GameState.Value.Phase;
-            if (phase == GamePhase.Warmup || phase == GamePhase.PreGame || phase == GamePhase.None) return;
-            
-            if (message.TryGetValue("team", out object teamObj))
+            if (playerInput == null || body == null) return;
+            try
             {
-                PlayerTeam scoredOnTeam = (PlayerTeam)teamObj;
-                if (scoredOnTeam == team)
+                Vector3 toPuck = puckPos - currentPos;
+                float angle = Vector3.SignedAngle(body.transform.forward, toPuck, Vector3.up);
+                if (!isSweeping)
                 {
-                    // Goal against us - trigger sad reaction
-                    isSadReaction = true;
-                    sadReactionEndTime = Time.time + 4f;
-                    sadLookUp = UnityEngine.Random.value < 0.3f;
-                    sadFallOver = UnityEngine.Random.value < 0.4f;
-                    
-                    if (sadFallOver && keepUpright != null)
-                    {
-                        keepUpright.Balance = 0f;
-                    }
+                    isSweeping = true;
+                    stickSweepTime = 0f;
+                    sweepDirection = angle > 0 ? 1f : -1f;
                 }
             }
+            catch { }
         }
-        catch (Exception) { }
-    }
-    
-    /// <summary>
-    /// Start a random idle fidget animation.
-    /// </summary>
-    private void StartIdleFidget()
-    {
-        isIdleFidgeting = true;
-        currentFidgetType = UnityEngine.Random.Range(0, 6);
-        fidgetStartTime = Time.time;
-        
-        switch (currentFidgetType)
+
+        private void UpdateStickSweep(Vector3 puckPos, Vector3 currentPos)
         {
-            case 0: fidgetDuration = 2.0f; break;  // Wide slow stick sweep
-            case 1: fidgetDuration = 1.5f; break;  // Stick spin/twirl
-            case 2: fidgetDuration = 1.0f; break;  // Nervous scanning
-            case 3: fidgetDuration = 2.5f; break;  // Figure-8 pattern
-            case 4: fidgetDuration = 1.5f; break;  // Bouncy taps
-            case 5: fidgetDuration = 1.0f; break;  // Rapid tapping
-            default: fidgetDuration = 1.5f; break;
-        }
-    }
-    
-    /// <summary>
-    /// Update the current idle fidget animation by setting stick angles.
-    /// </summary>
-    private void UpdateIdleFidget()
-    {
-        if (!isIdleFidgeting || playerInput == null) return;
-        
-        float elapsed = Time.time - fidgetStartTime;
-        if (elapsed >= fidgetDuration)
-        {
-            isIdleFidgeting = false;
-            currentFidgetType = -1;
-            ResetStickToCenter();
-            return;
-        }
-        
-        float t = elapsed / fidgetDuration;
-        float vertAngle = 30f;
-        float horizAngle = 0f;
-        
-        switch (currentFidgetType)
-        {
-            case 0: // Wide slow stick sweep
-                horizAngle = Mathf.Sin(t * Mathf.PI * 2f) * 60f;
-                break;
-            case 1: // Stick spin/twirl
-                horizAngle = Mathf.Sin(t * Mathf.PI * 4f) * 90f;
-                vertAngle = 30f + Mathf.Cos(t * Mathf.PI * 4f) * 25f;
-                break;
-            case 2: // Nervous scanning
-                horizAngle = Mathf.Sin(t * Mathf.PI * 8f) * 20f;
-                break;
-            case 3: // Figure-8 pattern
-                horizAngle = Mathf.Sin(t * Mathf.PI * 2f) * 45f;
-                vertAngle = 30f + Mathf.Sin(t * Mathf.PI * 4f) * 20f;
-                break;
-            case 4: // Bouncy taps
-                vertAngle = 30f + Mathf.Abs(Mathf.Sin(t * Mathf.PI * 6f)) * 30f;
-                break;
-            case 5: // Rapid tapping
-                vertAngle = 30f + Mathf.Abs(Mathf.Sin(t * Mathf.PI * 12f)) * 15f;
-                break;
-        }
-        
-        try
-        {
-            playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(vertAngle, horizAngle);
-        }
-        catch (Exception) { }
-    }
-    
-    private void ReturnToCenter(Vector3 currentPos, Vector3 gPos, bool redTeam)
-    {
-        if (playerInput == null || rb == null || body == null) return;
-        
-        try
-        {
-            Vector3 targetCenter = gPos;
-            targetCenter.z += redTeam ? 1.2f : -1.2f;
-            targetCenter.x = gPos.x;
-            
-            Vector3 toCenter = (targetCenter - currentPos);
-            toCenter.y = 0;
-            
-            float lateralDist = toCenter.x; // Signed - positive = need to go right
-            float forwardDist = Mathf.Abs(toCenter.z);
-            float lateralVelocity = 0f;
-            try { lateralVelocity = rb.linearVelocity.x; } catch (Exception) { }
-            
-            bool isSliding = false;
-            try { isSliding = body.IsSliding.Value; } catch (Exception) { }
-            
-            // Check if we're overshooting center - moving toward it fast
-            bool isOvershooting = Mathf.Abs(lateralDist) < 1.5f && 
-                                  ((lateralDist > 0 && lateralVelocity > 2f) || 
-                                   (lateralDist < 0 && lateralVelocity < -2f));
-            
-            // Start braking if overshooting
-            if (isOvershooting)
+            if (!isSweeping || playerInput == null || body == null) return;
+            try
             {
-                isBrakingOvershoot = true;
+                stickSweepTime += Time.fixedDeltaTime;
+                float progress = stickSweepTime / stickSweepDuration;
+
+                float sweepProgress = Mathf.Sin(progress * Mathf.PI);
+                float sweepAngle = sweepDirection * (45f - sweepProgress * 90f);
+
+                float puckHeight = puckPos.y;
+                float verticalAngle;
+                if (puckHeight < 0.1f) verticalAngle = 35f;
+                else if (puckHeight > 1.5f) verticalAngle = -20f;
+                else verticalAngle = Mathf.Lerp(35f, -20f, puckHeight / 1.5f);
+
+                playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(verticalAngle, sweepAngle);
+                if (progress >= 1f) isSweeping = false;
             }
-            
-            // Stop braking when velocity is near zero
-            if (isBrakingOvershoot && Mathf.Abs(lateralVelocity) < 0.5f)
+            catch { }
+        }
+
+        private void UpdateStickToTrackPuck(Vector3 puckPos, Vector3 currentPos)
+        {
+            if (playerInput == null || body == null) return;
+            try
             {
-                isBrakingOvershoot = false;
+                Vector3 toPuck = puckPos - currentPos;
+                float horizontalAngle = Vector3.SignedAngle(body.transform.forward, new Vector3(toPuck.x, 0, toPuck.z), Vector3.up);
+                horizontalAngle = Mathf.Clamp(horizontalAngle, -90f, 90f);
+
+                float puckHeight = puckPos.y;
+                float verticalAngle;
+                if (puckHeight < 0.1f) verticalAngle = 35f;
+                else if (puckHeight > 1.5f) verticalAngle = -20f;
+                else verticalAngle = Mathf.Lerp(35f, -20f, puckHeight / 1.5f);
+
+                playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(verticalAngle, horizontalAngle);
             }
-            
-            // Check if we're in post-dash stand period (normal dash control)
-            bool isPostDashStand = (Time.time - lastDashTime) < postDashStandDuration;
-            
-            if (isBrakingOvershoot || isPostDashStand)
+            catch { }
+        }
+
+        private void ResetStickToCenter()
+        {
+            if (playerInput == null) return;
+            try { playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(30f, 0f); } catch { }
+        }
+
+        /// <summary>
+        /// Turn the head to track a puck behind the net. Body keeps facing forward (handled by
+        /// ReturnToCenter); only the look angle moves. Recomputes every tick so as the body
+        /// slerps back to neutral, the head stays locked on the puck's world position.
+        /// LookAngleInput: x = pitch (positive looks down), y = yaw (positive looks right).
+        /// </summary>
+        private void LookAtPuckBehindNet(Vector3 puckPos, Vector3 currentPos)
+        {
+            if (playerInput == null || body == null) return;
+            try
             {
-                // Stand up to control momentum
-                try { playerInput.SlideInput.ServerValue = false; } catch (Exception) { }
+                Vector3 toPuck = puckPos - currentPos;
+                Vector3 toPuckFlat = new Vector3(toPuck.x, 0f, toPuck.z);
+                if (toPuckFlat.sqrMagnitude < 0.0001f) return;
+
+                // Horizontal yaw: signed angle from body forward to the puck direction.
+                float yaw = Vector3.SignedAngle(body.transform.forward, toPuckFlat.normalized, Vector3.up);
+                yaw = Mathf.Clamp(yaw, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+
+                // Vertical pitch: positive = looking down. Puck on the ice is below eye level,
+                // so the geometric angle (negative in math convention) is flipped to positive.
+                const float eyeHeight = 1.5f;
+                float vertDelta = puckPos.y - (currentPos.y + eyeHeight);
+                float horizDist = Mathf.Max(toPuckFlat.magnitude, 0.1f);
+                float pitch = -Mathf.Atan2(vertDelta, horizDist) * Mathf.Rad2Deg;
+                pitch = Mathf.Clamp(pitch, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+
+                playerInput.LookInput.ServerValue = true;
+                playerInput.LookAngleInput.ServerValue = new Vector2(pitch, yaw);
+                playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                short compX = NetworkingUtils.CompressFloatToShort(pitch, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                short compY = NetworkingUtils.CompressFloatToShort(yaw, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                playerInput.Server_LookAngleInputRpc(compX, compY, playerInput.RpcTarget.Everyone);
+                isLookingAtPuckBehind = true;
+
+                // Stick to the puck's side — yaw is already the body-relative angle to the puck.
+                // Clamp tighter than the head (the stick physically can't rotate as far around
+                // the body) and aim slightly downward since the puck is on the ice behind the net.
+                float stickYaw = Mathf.Clamp(yaw, -85f, 85f);
+                playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(35f, stickYaw);
             }
-            else if (Mathf.Abs(lateralDist) > 0.5f)
+            catch { }
+        }
+
+        private void StopLookingAtPuckBehind()
+        {
+            if (!isLookingAtPuckBehind) return;
+            isLookingAtPuckBehind = false;
+            try
             {
-                // Need to move laterally toward center
-                // First, make sure we're crouched
-                try { playerInput.SlideInput.ServerValue = true; } catch (Exception) { }
-                
-                // Always dash if we're sliding and cooldown is ready
-                if (isSliding && Time.time - lastDashTime > dashCooldown)
+                playerInput.LookInput.ServerValue = false;
+                playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Search specifically for the closest puck BEHIND the goal line (the primary puck
+        /// selector skips these because they're not threats). Limited to ~8m so the goalie
+        /// doesn't twist its head trying to look at a puck on the far side of the rink.
+        /// </summary>
+        private Puck GetClosestPuckBehindNet(Vector3 gPos)
+        {
+            try
+            {
+                var puckManager = PuckManager.Instance;
+                if (puckManager == null) return null;
+                var pucks = puckManager.GetPucks(false);
+                if (pucks == null || pucks.Count == 0) return null;
+
+                Puck closest = null;
+                float closestDist = float.MaxValue;
+
+                foreach (var puck in pucks)
+                {
+                    if (puck == null) continue;
+                    try
+                    {
+                        if (puck.gameObject == null || puck.transform == null) continue;
+                        if (puck.IsReplay != null && puck.IsReplay.Value) continue;
+                        Vector3 pp = puck.transform.position;
+                        bool isBehind = isRedTeam ? (pp.z < gPos.z) : (pp.z > gPos.z);
+                        if (!isBehind) continue;
+                        float dist = Vector3.Distance(gPos, pp);
+                        if (dist > 8f) continue;
+                        if (dist < closestDist) { closestDist = dist; closest = puck; }
+                    }
+                    catch { continue; }
+                }
+                return closest;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Helper for idle/no-threat paths: if a puck exists behind the net, turn the head to
+        /// watch it and return true (with the puck's world position via out param so callers
+        /// can also bias the body toward that side). Otherwise reset any active behind-net
+        /// look and return false.
+        /// </summary>
+        private bool TryLookAtPuckBehindNet(out Vector3 puckPosOut)
+        {
+            puckPosOut = Vector3.zero;
+            if (body == null || body.transform == null) return false;
+            Puck behind = GetClosestPuckBehindNet(goalPos);
+            if (behind == null || behind.transform == null)
+            {
+                StopLookingAtPuckBehind();
+                return false;
+            }
+            puckPosOut = behind.transform.position;
+            LookAtPuckBehindNet(puckPosOut, body.transform.position);
+            return true;
+        }
+
+        /// <summary>
+        /// Compute a lateral bias toward the puck behind the net. 40% of the puck's X position,
+        /// clamped to ±1.0m so the goalie still stays inside the goal width (~1.5m half-width)
+        /// without exposing the far post.
+        /// </summary>
+        private float ComputeBehindNetCheat(Vector3 puckPos)
+        {
+            return Mathf.Clamp(puckPos.x * 0.4f, -1.0f, 1.0f);
+        }
+
+        private void ReturnToCenter(Vector3 currentPos, Vector3 gPos, bool redTeam, float xBias = 0f)
+        {
+            if (playerInput == null || rb == null || body == null) return;
+            try
+            {
+                Vector3 targetCenter = gPos;
+                targetCenter.z += redTeam ? 1.2f : -1.2f;
+                targetCenter.x = xBias; // 0 = centered, ±ish = cheat toward a side
+
+                Vector3 toCenter = targetCenter - currentPos;
+                toCenter.y = 0;
+
+                float lateralDist = toCenter.x;
+                float forwardDist = Mathf.Abs(toCenter.z);
+                float lateralVelocity = 0f;
+                try { lateralVelocity = rb.linearVelocity.x; } catch { }
+
+                bool isSliding = false;
+                try { isSliding = body.IsSliding.Value; } catch { }
+
+                bool isOvershooting = Mathf.Abs(lateralDist) < 1.5f &&
+                                      ((lateralDist > 0 && lateralVelocity > 2f) ||
+                                       (lateralDist < 0 && lateralVelocity < -2f));
+                if (isOvershooting) isBrakingOvershoot = true;
+                if (isBrakingOvershoot && Mathf.Abs(lateralVelocity) < 0.5f) isBrakingOvershoot = false;
+
+                bool isPostDashStand = (Time.time - lastDashTime) < postDashStandDuration;
+
+                if (isBrakingOvershoot || isPostDashStand)
+                {
+                    try { playerInput.SlideInput.ServerValue = false; } catch { }
+                }
+                else if (Mathf.Abs(lateralDist) > 0.5f)
+                {
+                    try { playerInput.SlideInput.ServerValue = true; } catch { }
+                    if (isSliding && Time.time - lastDashTime > dashCooldown)
+                    {
+                        try
+                        {
+                            bool dashRight = redTeam ? (lateralDist > 0) : (lateralDist < 0);
+                            if (dashRight) body.DashRight(); else body.DashLeft();
+                            lastDashTime = Time.time;
+                        }
+                        catch { }
+                    }
+                }
+                else
+                {
+                    try { playerInput.SlideInput.ServerValue = false; } catch { }
+                }
+
+                if (!isSliding && forwardDist > 0.2f)
                 {
                     try
                     {
-                        // Blue goalie faces backward, so dash directions are inverted for them
-                        bool dashRight = redTeam ? (lateralDist > 0) : (lateralDist < 0);
-                        if (dashRight)
+                        bool needBackward = false, needForward = false;
+
+                        if (toCenter.z > 0.2f)
                         {
-                            body.DashRight();
+                            if (redTeam) { playerInput.MoveInput.ServerValue = new Vector2(0f, 1f); needForward = true; }
+                            else { playerInput.MoveInput.ServerValue = new Vector2(0f, -1f); needBackward = true; }
                         }
-                        else
+                        else if (toCenter.z < -0.2f)
                         {
-                            body.DashLeft();
+                            if (redTeam) { playerInput.MoveInput.ServerValue = new Vector2(0f, -1f); needBackward = true; }
+                            else { playerInput.MoveInput.ServerValue = new Vector2(0f, 1f); needForward = true; }
                         }
-                        lastDashTime = Time.time;
+
+                        if (rb != null && (needBackward || needForward))
+                        {
+                            float moveSpeed = 3.0f;
+                            Vector3 moveDir = toCenter.normalized; moveDir.y = 0;
+                            Vector3 currentVel = rb.linearVelocity;
+                            Vector3 targetVel = moveDir * moveSpeed; targetVel.y = currentVel.y;
+                            rb.linearVelocity = Vector3.Lerp(currentVel, targetVel, 0.1f);
+                        }
                     }
-                    catch (Exception) { }
+                    catch { }
                 }
-            }
-            else
-            {
-                // Close enough laterally, stand up for forward/back movement
-                try { playerInput.SlideInput.ServerValue = false; } catch (Exception) { }
-            }
-            
-            // Handle forward/back movement with MoveInput (only when standing)
-            // Also directly apply velocity for backward movement since CompetitivePuckTweaks
-            // zero drag can prevent MoveInput from being effective
-            if (!isSliding && forwardDist > 0.2f)
-            {
+                else if (!isSliding)
+                {
+                    try { playerInput.MoveInput.ServerValue = Vector2.zero; } catch { }
+                }
+
                 try
                 {
-                    bool needBackward = false;
-                    bool needForward = false;
-                    
-                    if (toCenter.z > 0.2f)
-                    {
-                        // Need to move in positive z
-                        if (redTeam)
-                        {
-                            playerInput.MoveInput.ServerValue = new Vector2(0f, 1f);
-                            needForward = true;
-                        }
-                        else
-                        {
-                            playerInput.MoveInput.ServerValue = new Vector2(0f, -1f);
-                            needBackward = true;
-                        }
-                    }
-                    else if (toCenter.z < -0.2f)
-                    {
-                        // Need to move in negative z
-                        if (redTeam)
-                        {
-                            playerInput.MoveInput.ServerValue = new Vector2(0f, -1f);
-                            needBackward = true;
-                        }
-                        else
-                        {
-                            playerInput.MoveInput.ServerValue = new Vector2(0f, 1f);
-                            needForward = true;
-                        }
-                    }
-                    
-                    // Directly apply velocity for backward movement to fight CompetitivePuckTweaks' zero drag
-                    if (rb != null && (needBackward || needForward))
-                    {
-                        float moveSpeed = 3.0f;
-                        Vector3 moveDir = toCenter.normalized;
-                        moveDir.y = 0;
-                        
-                        // Apply direct velocity impulse toward target
-                        Vector3 currentVel = rb.linearVelocity;
-                        Vector3 targetVel = moveDir * moveSpeed;
-                        targetVel.y = currentVel.y; // Preserve vertical velocity
-                        
-                        // Blend toward target velocity
-                        rb.linearVelocity = Vector3.Lerp(currentVel, targetVel, 0.1f);
-                    }
+                    Quaternion neutralRot = Quaternion.LookRotation(redTeam ? Vector3.forward : Vector3.back);
+                    body.transform.rotation = Quaternion.Slerp(body.transform.rotation, neutralRot, 0.05f);
                 }
-                catch (Exception) { }
+                catch { }
             }
-            else if (!isSliding)
-            {
-                try { playerInput.MoveInput.ServerValue = Vector2.zero; } catch (Exception) { }
-            }
-            
-            // Slowly return to neutral facing
+            catch { }
+        }
+
+        /// <summary>
+        /// True if the goalie should sweep rather than try to control/intercept the puck.
+        /// During Warmup (practice mode) this is always true regardless of teams — the user is
+        /// shooting at the goalie and expects sweeps. In actual games, it's true when ANY
+        /// non-AI opposing player is within DangerRange of the puck.
+        /// </summary>
+        private const float DangerRange = 10f;
+        private bool IsPuckDangerous(Vector3 puckPos)
+        {
+            // Practice override: in warmup, every shot is "dangerous" so the goalie always sweeps.
             try
             {
-                Quaternion neutralRot = Quaternion.LookRotation(redTeam ? Vector3.forward : Vector3.back);
-                body.transform.rotation = Quaternion.Slerp(body.transform.rotation, neutralRot, 0.05f);
+                var gm = NetworkBehaviourSingleton<GameManager>.Instance;
+                if (gm != null && gm.Phase == GamePhase.Warmup) return true;
             }
-            catch (Exception) { }
-            
-            // Idle fidget tracking
-            idleTimer += updateInterval;
-            if (idleTimer >= IDLE_FIDGET_DELAY && !isIdleFidgeting)
+            catch { }
+
+            try
             {
-                StartIdleFidget();
+                var pm = PlayerManager.Instance;
+                if (pm == null) return false;
+                var players = pm.GetSpawnedPlayers(false);
+                if (players == null) return false;
+
+                foreach (var p in players)
+                {
+                    if (p == null) continue;
+                    try
+                    {
+                        if (p.IsReplay != null && p.IsReplay.Value) continue;
+                        if (p == controlledPlayer) continue;
+                        if (p.Team == team) continue;            // skip teammates
+                        if (p.PlayerBody == null) continue;
+                        float d = Vector3.Distance(p.PlayerBody.transform.position, puckPos);
+                        if (d < DangerRange) return true;
+                    }
+                    catch { continue; }
+                }
+                return false;
             }
-            if (isIdleFidgeting)
-            {
-                UpdateIdleFidget();
-            }
-            
-            // Reset head look to neutral when idle
-            BroadcastLookInput(false);
-            BroadcastLookAngle(25f, 0f);
+            catch { return false; }
         }
-        catch (Exception) { }
-    }
-    
-    private Puck GetClosestPuckSafe(Vector3 gPos)
-    {
-        try
+
+        /// <summary>
+        /// Find a teammate to pass to (closest non-goalie attacker, 3-25m away). Returns null
+        /// when there's nobody to pass to (e.g. single-player practice).
+        /// </summary>
+        private Vector3? FindPassTarget(Vector3 fromPos)
         {
-            var puckManager = MonoBehaviourSingleton<PuckManager>.Instance;
-            if (puckManager == null) return null;
-            
-            var pucks = puckManager.GetPucks(false);
-            if (pucks == null || pucks.Count == 0) return null;
-            
-            Puck bestPuck = null;
-            float bestScore = float.MinValue;
-            
-            foreach (var puck in pucks)
+            try
             {
-                if (puck == null) continue;
-                
+                var pm = PlayerManager.Instance;
+                if (pm == null) return null;
+                var players = pm.GetSpawnedPlayers(false);
+                if (players == null || players.Count == 0) return null;
+
+                Vector3? best = null;
+                float bestDist = float.MaxValue;
+                foreach (var p in players)
+                {
+                    if (p == null) continue;
+                    try
+                    {
+                        if (p.IsReplay != null && p.IsReplay.Value) continue;
+                        if (p == controlledPlayer) continue;
+                        if (p.Team != team) continue;                      // same team only
+                        if (p.Role == PlayerRole.Goalie) continue;         // skip the other goalie
+                        if (p.PlayerBody == null) continue;
+                        Vector3 ppos = p.PlayerBody.transform.position;
+                        float d = Vector3.Distance(fromPos, ppos);
+                        if (d > 25f || d < 3f) continue;
+                        if (d < bestDist) { bestDist = d; best = ppos; }
+                    }
+                    catch { continue; }
+                }
+                return best;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Outlet pass attempt: aim the stick toward the teammate and give the puck a velocity
+        /// in that direction. Speed scales with distance. Only called when conditions are safe
+        /// and the puck is essentially on/very-near the stick blade.
+        /// </summary>
+        private void TryPassPuck(Vector3 puckPos, Vector3 currentPos)
+        {
+            Vector3? targetOpt = FindPassTarget(currentPos);
+            if (!targetOpt.HasValue) return;
+
+            Vector3 target = targetOpt.Value;
+            Vector3 toTargetFlat = new Vector3(target.x - currentPos.x, 0f, target.z - currentPos.z);
+            if (toTargetFlat.sqrMagnitude < 0.01f) return;
+
+            // Stick angle toward the teammate — clamped to physically reachable yaw.
+            try
+            {
+                float yaw = Vector3.SignedAngle(body.transform.forward, toTargetFlat.normalized, Vector3.up);
+                yaw = Mathf.Clamp(yaw, -85f, 85f);
+                playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(30f, yaw);
+            }
+            catch { }
+
+            // Apply pass velocity. Faster pass for further targets, with a small lift so the
+            // puck slides cleanly across the ice.
+            if (trackedPuck != null && trackedPuck.Rigidbody != null)
+            {
                 try
                 {
-                    if (puck.gameObject == null) continue;
-                    if (puck.transform == null) continue;
-                    if (puck.IsReplay != null && puck.IsReplay.Value) continue;
-                    
-                    Vector3 puckPos = puck.transform.position;
-                    
-                    // Filter out pucks behind the goal line - don't even consider them
-                    bool puckBehindGoalLine = isRedTeam ? (puckPos.z < gPos.z) : (puckPos.z > gPos.z);
-                    if (puckBehindGoalLine) continue;
-                    
-                    float dist = Vector3.Distance(gPos, puckPos);
-                    
-                    // Get puck velocity to prioritize fast incoming pucks
-                    float puckSpeed = 0f;
-                    float approachFactor = 0f;
-                    if (puck.Rigidbody != null)
+                    Vector3 passDir = (target - puckPos);
+                    passDir.y = 0f;
+                    float passDist = passDir.magnitude;
+                    if (passDist > 0.1f)
                     {
-                        Vector3 vel = puck.Rigidbody.linearVelocity;
-                        puckSpeed = vel.magnitude;
-                        
-                        // Check if puck is coming toward the goal
-                        Vector3 toGoal = (gPos - puckPos).normalized;
-                        approachFactor = Vector3.Dot(vel.normalized, toGoal);
-                        approachFactor = Mathf.Max(0f, approachFactor); // Only care if approaching
-                    }
-                    
-                    // Calculate "in front" vs "to the side" factor
-                    // Pucks directly in front should be seen further than pucks to the sides
-                    float lateralDist = Mathf.Abs(puckPos.x - gPos.x);
-                    float depthDist = Mathf.Abs(puckPos.z - gPos.z);
-                    
-                    // Effective distance: lateral counts 2x as much (so pucks to side seem further away)
-                    float effectiveDist = Mathf.Sqrt(lateralDist * lateralDist * 4f + depthDist * depthDist);
-                    
-                    // Score: closer is better, but fast approaching pucks get huge priority
-                    // Fast pucks coming at goal should be seen from much further away
-                    float distScore = 100f / Mathf.Max(effectiveDist, 1f);
-                    float speedScore = puckSpeed * approachFactor * 5f; // Big bonus for fast incoming
-                    float score = distScore + speedScore;
-                    
-                    if (score > bestScore)
-                    {
-                        bestScore = score;
-                        bestPuck = puck;
+                        passDir /= passDist;
+                        float passSpeed = Mathf.Clamp(passDist * 1.4f, 8f, 18f);
+                        trackedPuck.Rigidbody.linearVelocity = passDir * passSpeed + Vector3.up * 0.4f;
                     }
                 }
-                catch (Exception) { continue; }
+                catch { }
             }
-            
-            return bestPuck;
         }
-        catch (Exception)
+
+        private Puck GetClosestPuckSafe(Vector3 gPos)
         {
-            return null;
-        }
-    }
-    
-    private IEnumerator ResetAfterSave()
-    {
-        yield return new WaitForSeconds(2.0f);
-        
-        if (controlledPlayer == null || !MaxPracticePlugin.FakePlayers.Contains(controlledPlayer))
-        {
-            resetScheduled = false;
-            yield break;
-        }
-        
-        // Skip reset if in sad reaction
-        if (isSadReaction)
-        {
-            resetScheduled = false;
-            yield break;
-        }
-        
-        try
-        {
-            // Just reset position instead of despawning/respawning
-            bool isRed = team == PlayerTeam.Red;
-            Vector3 resetPos = goalPos;
-            resetPos.z += isRed ? 1.2f : -1.2f;
-            resetPos.y = 0f;
-            
-            if (body != null && body.transform != null)
+            try
             {
-                body.transform.position = resetPos;
-                Quaternion resetRot = Quaternion.LookRotation(isRed ? Vector3.forward : Vector3.back);
-                body.transform.rotation = resetRot;
+                var puckManager = PuckManager.Instance;
+                if (puckManager == null) return null;
+                var pucks = puckManager.GetPucks(false);
+                if (pucks == null || pucks.Count == 0) return null;
+
+                Puck bestPuck = null;
+                float bestScore = float.MinValue;
+
+                foreach (var puck in pucks)
+                {
+                    if (puck == null) continue;
+                    try
+                    {
+                        if (puck.gameObject == null) continue;
+                        if (puck.transform == null) continue;
+                        if (puck.IsReplay != null && puck.IsReplay.Value) continue;
+
+                        Vector3 puckPos = puck.transform.position;
+                        bool puckBehindGoalLine = isRedTeam ? (puckPos.z < gPos.z) : (puckPos.z > gPos.z);
+                        if (puckBehindGoalLine) continue;
+
+                        float dist = Vector3.Distance(gPos, puckPos);
+                        float puckSpeed = 0f;
+                        float approachFactor = 0f;
+                        if (puck.Rigidbody != null)
+                        {
+                            Vector3 vel = puck.Rigidbody.linearVelocity;
+                            puckSpeed = vel.magnitude;
+                            Vector3 toGoal = (gPos - puckPos).normalized;
+                            approachFactor = Mathf.Max(0f, Vector3.Dot(vel.normalized, toGoal));
+                        }
+
+                        float lateralDist = Mathf.Abs(puckPos.x - gPos.x);
+                        float depthDist = Mathf.Abs(puckPos.z - gPos.z);
+                        float effectiveDist = Mathf.Sqrt(lateralDist * lateralDist * 4f + depthDist * depthDist);
+
+                        float distScore = 100f / Mathf.Max(effectiveDist, 1f);
+                        float speedScore = puckSpeed * approachFactor * 5f;
+                        float score = distScore + speedScore;
+
+                        if (score > bestScore) { bestScore = score; bestPuck = puck; }
+                    }
+                    catch { continue; }
+                }
+
+                return bestPuck;
             }
-            
-            if (rb != null)
+            catch { return null; }
+        }
+
+        private IEnumerator ResetAfterSave()
+        {
+            yield return new WaitForSeconds(2.0f);
+
+            if (controlledPlayer == null || !GoalieAIManager.IsAIGoalie(controlledPlayer))
             {
-                rb.linearVelocity = Vector3.zero;
-                rb.angularVelocity = Vector3.zero;
+                resetScheduled = false;
+                yield break;
             }
-            
-            // Reset all inputs
-            ResetInputs();
+            if (isSad) { resetScheduled = false; yield break; }
+
+            try
+            {
+                bool isRed = team == PlayerTeam.Red;
+                Vector3 gPos = isRed ? redGoalPos : blueGoalPos;
+                Vector3 resetPos = gPos;
+                resetPos.z += isRed ? 1.2f : -1.2f;
+                resetPos.y = 0f;
+
+                if (body != null && body.transform != null)
+                {
+                    body.transform.position = resetPos;
+                    body.transform.rotation = Quaternion.LookRotation(isRed ? Vector3.forward : Vector3.back);
+                }
+                if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
+                ResetInputs();
+            }
+            catch { }
+
+            resetScheduled = false;
         }
-        catch (Exception) { }
-        
-        resetScheduled = false;
-    }
-    
-    private void OnDestroy()
-    {
-        try
+
+        private void ExitIdle()
         {
-            ResetInputs();
-            BroadcastLookInput(false);
+            if (isIdling)
+            {
+                isIdling = false;
+                try
+                {
+                    playerInput.LookInput.ServerValue = false;
+                    playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+                }
+                catch { }
+            }
+            idleTimer = 0f;
         }
-        catch (Exception) { }
-        
-        try
+
+        private void UpdateIdle()
         {
-            EventManager.RemoveEventListener("Event_Server_OnPuckEnterGoal", OnGoalScored);
+            idleTimer += updateInterval;
+            if (idleTimer < IDLE_DELAY) { isIdling = false; return; }
+
+            isIdling = true;
+            idlePhase += updateInterval;
+            idleBehaviorTimer += updateInterval;
+
+            if (idleBehaviorTimer >= idleBehaviorDuration)
+            {
+                idleBehavior = UnityEngine.Random.Range(0, 6);
+                idleBehaviorDuration = UnityEngine.Random.Range(2.0f, 5.0f);
+                idleBehaviorTimer = 0f;
+            }
+
+            try
+            {
+                float stickV = 30f, stickH = 0f, lookV = 30f, lookH = 0f;
+                bool doLook = true;
+
+                switch (idleBehavior)
+                {
+                    case 0:
+                        stickV = 30f + Mathf.Sin(idlePhase * 1.2f) * 8f;
+                        stickH = Mathf.Sin(idlePhase * 0.7f) * 35f;
+                        lookH = Mathf.Sin(idlePhase * 0.3f) * 15f;
+                        lookV = 32f;
+                        break;
+                    case 1:
+                        stickV = 25f + Mathf.Sin(idlePhase * 2.0f) * 15f;
+                        stickH = Mathf.Cos(idlePhase * 2.0f) * 30f;
+                        lookV = 35f + Mathf.Sin(idlePhase * 0.4f) * 5f;
+                        lookH = Mathf.Sin(idlePhase * 0.5f) * 10f;
+                        break;
+                    case 2:
+                        stickV = 30f + Mathf.Sin(idlePhase * 0.6f) * 3f;
+                        stickH = Mathf.Sin(idlePhase * 0.8f) * 5f;
+                        lookH = Mathf.Sin(idlePhase * 1.5f) * 40f + Mathf.Sin(idlePhase * 3.2f) * 10f;
+                        lookV = 28f + Mathf.Sin(idlePhase * 0.9f) * 12f;
+                        break;
+                    case 3:
+                        stickV = 28f + Mathf.Sin(idlePhase * 1.5f) * 12f;
+                        stickH = Mathf.Sin(idlePhase * 0.75f) * 35f;
+                        lookH = -stickH * 0.3f;
+                        lookV = 30f;
+                        break;
+                    case 4:
+                        stickV = 30f + Mathf.Abs(Mathf.Sin(idlePhase * 3.0f)) * 10f;
+                        stickH = Mathf.Sin(idlePhase * 0.4f) * 8f;
+                        lookV = 30f + Mathf.Abs(Mathf.Sin(idlePhase * 3.0f)) * 5f;
+                        lookH = Mathf.Sin(idlePhase * 0.6f) * 8f;
+                        break;
+                    case 5:
+                        stickV = 30f + Mathf.Abs(Mathf.Sin(idlePhase * 8.0f)) * 18f;
+                        stickH = Mathf.Sin(idlePhase * 0.3f) * 4f;
+                        lookV = 40f;
+                        lookH = Mathf.Sin(idlePhase * 0.5f) * 5f;
+                        break;
+                }
+
+                playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(stickV, stickH);
+
+                if (doLook)
+                {
+                    playerInput.LookInput.ServerValue = true;
+                    playerInput.LookAngleInput.ServerValue = new Vector2(lookV, lookH);
+                    playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                    short compX = NetworkingUtils.CompressFloatToShort(lookV, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                    short compY = NetworkingUtils.CompressFloatToShort(lookH, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                    playerInput.Server_LookAngleInputRpc(compX, compY, playerInput.RpcTarget.Everyone);
+                }
+            }
+            catch { }
         }
-        catch (Exception) { }
+
+        /// <summary>
+        /// Excited celebration: stick raised in the air, waving back and forth, jumping in place.
+        /// Fires when the goalie's OWN team scores.
+        /// </summary>
+        public void TriggerCelebrate() => TriggerCelebrate(CELEBRATE_DURATION);
+
+        public void TriggerCelebrate(float duration)
+        {
+            // Don't celebrate over sad — if we somehow got both (shouldn't happen), sad wins.
+            if (isSad) return;
+            isCelebrating = true;
+            celebrateTimer = duration;
+            celebratePhase = 0f;
+            lastCelebrateJumpTime = 0f;
+            // 50/50 between wave and spin animations.
+            celebrateMode = UnityEngine.Random.value < 0.5f ? 0 : 1;
+        }
+
+        private void UpdateCelebrateState()
+        {
+            if (!isCelebrating) return;
+
+            celebrateTimer -= updateInterval;
+            celebratePhase += updateInterval;
+
+            if (celebrateTimer <= 0f)
+            {
+                isCelebrating = false;
+                try
+                {
+                    playerInput.LookInput.ServerValue = false;
+                    playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+                }
+                catch { }
+                return;
+            }
+
+            try
+            {
+                // Keep stamina pinned at 1 — every Jump() drains stamina, so without this the
+                // goalie runs out after 2-3 jumps and stops bouncing. Also restore upright state
+                // in case a prior sad reaction's 40% flop left Balance=0 / HasFallen=true.
+                try { body.Stamina.Value = 1f; } catch { }
+                try { if (body.KeepUpright != null) body.KeepUpright.Balance = 1f; } catch { }
+                try { body.HasFallen = false; body.HasSlipped = false; } catch { }
+
+                // Zero out movement — celebrating in place.
+                playerInput.MoveInput.ServerValue = Vector2.zero;
+                playerInput.LateralLeftInput.ServerValue = false;
+                playerInput.LateralRightInput.ServerValue = false;
+                playerInput.DashLeftInput.ServerValue = 0;
+                playerInput.DashRightInput.ServerValue = 0;
+                playerInput.SlideInput.ServerValue = false; // standing, not butterfly
+                playerInput.StopInput.ServerValue = false;
+
+                float lookV, lookH;
+
+                if (celebrateMode == 1)
+                {
+                    // SPIN mode — rotate body in place, stick held up high.
+                    if (body != null && body.transform != null)
+                    {
+                        body.transform.Rotate(Vector3.up, 540f * updateInterval); // ~1.5 rps
+                    }
+                    // Stick raised, slight wobble.
+                    float stickVSpin = -25f + Mathf.Sin(celebratePhase * 6f) * 5f;
+                    float stickHSpin = Mathf.Sin(celebratePhase * 4f) * 20f;
+                    playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(stickVSpin, stickHSpin);
+                    // Look up, head bobbing slightly.
+                    lookV = -10f + Mathf.Sin(celebratePhase * 5f) * 6f;
+                    lookH = 0f;
+                }
+                else
+                {
+                    // WAVE mode — stick raised high, waving back and forth.
+                    float stickV = -25f + Mathf.Sin(celebratePhase * 8f) * 8f; // bob the raised stick
+                    float stickH = Mathf.Sin(celebratePhase * 6f) * 60f;       // wave left/right
+                    playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(stickV, stickH);
+                    // Look at the crowd, head bobs side to side.
+                    lookV = -10f + Mathf.Sin(celebratePhase * 4f) * 8f;
+                    lookH = Mathf.Sin(celebratePhase * 3f) * 25f;
+                }
+
+                // Look RPC replication — same for both modes.
+                playerInput.LookInput.ServerValue = true;
+                playerInput.LookAngleInput.ServerValue = new Vector2(lookV, lookH);
+                playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                short compX = NetworkingUtils.CompressFloatToShort(lookV, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                short compY = NetworkingUtils.CompressFloatToShort(lookH, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                playerInput.Server_LookAngleInputRpc(compX, compY, playerInput.RpcTarget.Everyone);
+
+                // Bounce: invoke PlayerBody.Jump() directly every CELEBRATE_JUMP_INTERVAL.
+                // Going through JumpInput.ServerValue += 1 relies on the body polling the
+                // input on its tick — works for in-game high-shot blocks but was sometimes
+                // skipped during celebrate. Direct Jump() always fires the impulse.
+                // IsJumping guard prevents stacking impulses while mid-air.
+                if (Time.time - lastCelebrateJumpTime > CELEBRATE_JUMP_INTERVAL)
+                {
+                    bool inAir = false;
+                    try { inAir = body.IsJumping; } catch { }
+                    if (!inAir)
+                    {
+                        try { body.Jump(); } catch { }
+                        try { playerInput.JumpInput.ServerValue += 1; } catch { } // also bump input for replication
+                        lastCelebrateJumpTime = Time.time;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public void TriggerSad() => TriggerSad(SAD_DURATION);
+
+        public void TriggerSad(float duration)
+        {
+            isSad = true;
+            sadTimer = duration;
+
+            // 40% chance to dramatically fall over.
+            if (UnityEngine.Random.value < 0.4f)
+            {
+                try { if (body != null && body.KeepUpright != null) body.KeepUpright.Balance = 0f; } catch { }
+            }
+            sadLookUp = UnityEngine.Random.value < 0.3f;
+        }
+
+        private void UpdateSadState()
+        {
+            if (!isSad) return;
+            sadTimer -= updateInterval;
+            if (sadTimer <= 0f)
+            {
+                isSad = false;
+                try
+                {
+                    playerInput.LookInput.ServerValue = false;
+                    playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+                }
+                catch { }
+                return;
+            }
+
+            try
+            {
+                // Zero out movement so the goalie doesn't drift while sad.
+                playerInput.MoveInput.ServerValue = Vector2.zero;
+                playerInput.LateralLeftInput.ServerValue = false;
+                playerInput.LateralRightInput.ServerValue = false;
+                playerInput.DashLeftInput.ServerValue = 0;
+                playerInput.DashRightInput.ServerValue = 0;
+                playerInput.StopInput.ServerValue = true;
+
+                // Butterfly crouch.
+                playerInput.SlideInput.ServerValue = true;
+
+                // Park the stick in a neutral "down" position — otherwise it stays pointed
+                // wherever the last puck-track call left it, which looks weird mid-sad.
+                playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(35f, 0f);
+
+                // Look down (sad) or up (why me?!) and replicate via RPC.
+                playerInput.LookInput.ServerValue = true;
+                playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                Vector2 sadAngle = sadLookUp ? new Vector2(-25f, 0f) : new Vector2(75f, 0f);
+                playerInput.LookAngleInput.ServerValue = sadAngle;
+
+                short compX = NetworkingUtils.CompressFloatToShort(sadAngle.x, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                short compY = NetworkingUtils.CompressFloatToShort(sadAngle.y, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                playerInput.Server_LookAngleInputRpc(compX, compY, playerInput.RpcTarget.Everyone);
+            }
+            catch { }
+        }
+
+        public void TriggerIntermission()
+        {
+            isIntermission = true;
+            intermissionTimer = 0f;
+            intermissionPhase = 0f;
+            intermissionDashTimer = 0f;
+            intermissionFallen = false;
+            ExitIdle();
+
+            intermissionBehavior = UnityEngine.Random.Range(0, 7);
+            float angle = UnityEngine.Random.Range(0f, 360f) * Mathf.Deg2Rad;
+            intermissionDirection = new Vector3(Mathf.Sin(angle), 0f, Mathf.Cos(angle));
+        }
+
+        public void ExitIntermission()
+        {
+            if (!isIntermission) return;
+            isIntermission = false;
+            intermissionBehavior = -1;
+            ResetInputs();
+
+            if (intermissionFallen)
+            {
+                intermissionFallen = false;
+                try
+                {
+                    if (body != null && body.KeepUpright != null) body.KeepUpright.Balance = 1f;
+                    if (body != null) { body.HasFallen = false; body.HasSlipped = false; }
+                }
+                catch { }
+            }
+
+            try
+            {
+                playerInput.LookInput.ServerValue = false;
+                playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+            }
+            catch { }
+        }
+
+        private void UpdateIntermission()
+        {
+            if (!isIntermission || playerInput == null || body == null) return;
+
+            intermissionTimer += updateInterval;
+            intermissionPhase += updateInterval;
+
+            try
+            {
+                switch (intermissionBehavior)
+                {
+                    case 0:
+                    {
+                        playerInput.SlideInput.ServerValue = false;
+                        Vector2 moveDir = isRedTeam ? new Vector2(0f, 1f) : new Vector2(0f, -1f);
+                        playerInput.MoveInput.ServerValue = moveDir;
+
+                        float stickH = Mathf.Sin(intermissionPhase * 4f) * 40f;
+                        playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(25f, stickH);
+
+                        playerInput.LookInput.ServerValue = true;
+                        float lookH = Mathf.Sin(intermissionPhase * 2f) * 25f;
+                        playerInput.LookAngleInput.ServerValue = new Vector2(25f, lookH);
+                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        short cx0 = NetworkingUtils.CompressFloatToShort(25f, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                        short cy0 = NetworkingUtils.CompressFloatToShort(lookH, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                        playerInput.Server_LookAngleInputRpc(cx0, cy0, playerInput.RpcTarget.Everyone);
+                        break;
+                    }
+
+                    case 1:
+                    {
+                        playerInput.SlideInput.ServerValue = false;
+                        playerInput.MoveInput.ServerValue = Vector2.zero;
+
+                        if (rb != null) body.transform.Rotate(Vector3.up, 360f * updateInterval);
+
+                        playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(15f, 45f);
+                        playerInput.LookInput.ServerValue = true;
+                        playerInput.LookAngleInput.ServerValue = new Vector2(10f, 0f);
+                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        short cx1 = NetworkingUtils.CompressFloatToShort(10f, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                        short cy1 = NetworkingUtils.CompressFloatToShort(0f, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                        playerInput.Server_LookAngleInputRpc(cx1, cy1, playerInput.RpcTarget.Everyone);
+                        break;
+                    }
+
+                    case 2:
+                    {
+                        if (!intermissionFallen)
+                        {
+                            intermissionFallen = true;
+                            if (body.KeepUpright != null) body.KeepUpright.Balance = 0f;
+                            if (rb != null) rb.AddForce(intermissionDirection * 2f, ForceMode.Impulse);
+
+                            playerInput.LookInput.ServerValue = true;
+                            playerInput.LookAngleInput.ServerValue = new Vector2(75f, 0f);
+                            playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                            short cx2 = NetworkingUtils.CompressFloatToShort(75f, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                            short cy2 = NetworkingUtils.CompressFloatToShort(0f, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                            playerInput.Server_LookAngleInputRpc(cx2, cy2, playerInput.RpcTarget.Everyone);
+                        }
+                        ResetInputs();
+                        break;
+                    }
+
+                    case 3:
+                    {
+                        playerInput.SlideInput.ServerValue = true;
+
+                        float moveX = intermissionDirection.x;
+                        float moveZ = intermissionDirection.z;
+                        playerInput.MoveInput.ServerValue = new Vector2(
+                            Mathf.Clamp(moveX, -1f, 1f),
+                            Mathf.Clamp(isRedTeam ? moveZ : -moveZ, -1f, 1f));
+
+                        intermissionDashTimer += updateInterval;
+                        if (intermissionDashTimer > 0.15f)
+                        {
+                            intermissionDashTimer = 0f;
+                            bool isSliding = false;
+                            try { isSliding = body.IsSliding.Value; } catch { }
+                            if (isSliding)
+                            {
+                                if (moveX > 0) body.DashRight(); else body.DashLeft();
+                            }
+                        }
+
+                        float stickH3 = Mathf.Sin(intermissionPhase * 8f) * 50f;
+                        playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(20f, stickH3);
+                        break;
+                    }
+
+                    case 4:
+                    {
+                        playerInput.SlideInput.ServerValue = true;
+
+                        intermissionDashTimer += updateInterval;
+                        if (intermissionDashTimer > 0.3f)
+                        {
+                            intermissionDashTimer = 0f;
+                            bool isSliding = false;
+                            try { isSliding = body.IsSliding.Value; } catch { }
+                            if (isSliding)
+                            {
+                                if (Mathf.Sin(intermissionPhase * 3f) > 0) body.DashRight();
+                                else body.DashLeft();
+                            }
+                        }
+
+                        float sv4 = 20f + Mathf.Abs(Mathf.Sin(intermissionPhase * 6f)) * 20f;
+                        float sh4 = Mathf.Sin(intermissionPhase * 3f) * 40f;
+                        playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(sv4, sh4);
+
+                        playerInput.LookInput.ServerValue = true;
+                        float lookV4 = 25f + Mathf.Sin(intermissionPhase * 4f) * 15f;
+                        float lookH4 = Mathf.Sin(intermissionPhase * 3f) * 20f;
+                        playerInput.LookAngleInput.ServerValue = new Vector2(lookV4, lookH4);
+                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        short vx4 = NetworkingUtils.CompressFloatToShort(lookV4, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                        short vy4 = NetworkingUtils.CompressFloatToShort(lookH4, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                        playerInput.Server_LookAngleInputRpc(vx4, vy4, playerInput.RpcTarget.Everyone);
+                        break;
+                    }
+
+                    case 5:
+                    {
+                        playerInput.SlideInput.ServerValue = false;
+                        playerInput.MoveInput.ServerValue = Vector2.zero;
+
+                        float sv5 = 15f + Mathf.Sin(intermissionPhase * 4f) * 25f;
+                        float sh5 = Mathf.Cos(intermissionPhase * 4f) * 50f;
+                        playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(sv5, sh5);
+
+                        playerInput.LookInput.ServerValue = true;
+                        float lookH5 = Mathf.Sin(intermissionPhase * 2.5f) * 50f;
+                        float lookV5 = 20f + Mathf.Sin(intermissionPhase * 1.8f) * 20f;
+                        playerInput.LookAngleInput.ServerValue = new Vector2(lookV5, lookH5);
+                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        short wx5 = NetworkingUtils.CompressFloatToShort(lookV5, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                        short wy5 = NetworkingUtils.CompressFloatToShort(lookH5, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                        playerInput.Server_LookAngleInputRpc(wx5, wy5, playerInput.RpcTarget.Everyone);
+                        break;
+                    }
+
+                    case 6:
+                    {
+                        playerInput.MoveInput.ServerValue = Vector2.zero;
+                        bool slideOn = Mathf.Sin(intermissionPhase * 5f) > 0;
+                        playerInput.SlideInput.ServerValue = slideOn;
+
+                        float sv6 = slideOn ? 40f : 20f;
+                        float sh6 = Mathf.Sin(intermissionPhase * 2f) * 15f;
+                        playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(sv6, sh6);
+
+                        playerInput.LookInput.ServerValue = true;
+                        float lookV6 = slideOn ? 50f : 25f;
+                        playerInput.LookAngleInput.ServerValue = new Vector2(lookV6, 0f);
+                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        short bx6 = NetworkingUtils.CompressFloatToShort(lookV6, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
+                        short by6 = NetworkingUtils.CompressFloatToShort(0f, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
+                        playerInput.Server_LookAngleInputRpc(bx6, by6, playerInput.RpcTarget.Everyone);
+                        break;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void OnDestroy()
+        {
+            try { ResetInputs(); } catch { }
+        }
     }
 }

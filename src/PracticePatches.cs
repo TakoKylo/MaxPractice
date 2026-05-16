@@ -920,6 +920,25 @@ public static class FakePlayerStickFixedUpdatePatch
 }
 
 // ============================================================================
+// AUTO-SHOW CHAT ON NEW MESSAGE — client-side
+// Without this, the chat panel may be hidden when our mod sends system messages
+// (vote results, "Puck spawned.", etc.), so players don't see the feedback.
+// Patches UIChat.AddChatMessage (client-only) to call Show() right after a message
+// is added to the message list. On dedicated servers UIChat instances don't exist,
+// so the patch is dormant there.
+// ============================================================================
+[HarmonyPatch(typeof(UIChat), nameof(UIChat.AddChatMessage))]
+public static class UIChat_AutoShow_Patch
+{
+    [HarmonyPostfix]
+    public static void Postfix(UIChat __instance)
+    {
+        try { if (__instance != null) __instance.Show(); }
+        catch { }
+    }
+}
+
+// ============================================================================
 // VOTE SYSTEM PATCHES - Exclude fake players from vote calculations
 // The game calculates votes needed using PlayerManager.GetPlayers().Count
 // We patch VoteManagerController to exclude our fake players from that count.

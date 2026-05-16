@@ -55,6 +55,13 @@ public static class PracticeCommandPatch
             // Check for numbered clear commands (e.g., /cleartraffic1, /clearpasser2)
             bool isNumberedClearCmd = cmd.StartsWith("/cleartraffic") || cmd.StartsWith("/clearpasser");
 
+            // /votegoalies — toggle AI goalies on/off via majority vote. Works in any phase (not warmup-gated).
+            if (cmd == "/votegoalies" || cmd == "/vg")
+            {
+                HandleVoteGoalies(ui, player, clientId);
+                return false;
+            }
+
             bool practiceCmd = cmd == "/infinitestamina" || cmd == "/is" ||
                          cmd == "/spawnpuck" || cmd == "/s" ||
                          cmd == "/clearpucks" || cmd == "/clear" || cmd == "/c" || cmd == "/emptypucks" ||
@@ -1192,100 +1199,85 @@ public static class PracticeCommandPatch
         }
     }
 
+    private static void HandleVoteGoalies(UIChat ui, Player player, ulong clientId)
+    {
+        // Two independent gates:
+        // - EnableGoalieVoting: server admin's opt-in for mid-game AI goalie voting (default true).
+        // - DisableVoting: global vote killswitch shared with /vs and /vw.
+        if (!cfg.EnableGoalieVoting)
+        {
+            PracticeHelpers.SendChatMessage(ui, RED + "Mid-game AI goalie voting is disabled on this server." + EC, clientId);
+            return;
+        }
+        if (cfg.DisableVoting)
+        {
+            PracticeHelpers.SendChatMessage(ui, RED + "Voting is disabled on this server." + EC, clientId);
+            return;
+        }
+
+        if (!GoalieVote.IsActive)
+        {
+            if (!GoalieVote.Start(player, out string reason))
+            {
+                PracticeHelpers.SendChatMessage(ui, RED + reason + EC, clientId);
+                return;
+            }
+            // If Start passed the vote instantly (e.g. solo player → 1/1), Finish() already
+            // broadcast the result and IsActive is now false. Skip the "started a vote" announce.
+            if (!GoalieVote.IsActive) return;
+
+            string verb = GoalieVote.TargetState ? "ENABLE" : "DISABLE";
+            PracticeHelpers.SendChatMessage(ui, ORANGE + B + player.Username.Value + EB + EC + WHITE +
+                $" started a vote to {verb} AI goalies. Type /votegoalies (or /vg) to vote yes. {GoalieVote.CurrentYes}/{GoalieVote.Needed} so far, {(int)GoalieVote.SecondsRemaining}s remaining." + EC);
+            return;
+        }
+
+        // Vote already active — register this player's yes.
+        var (counted, finished, passed) = GoalieVote.Vote(player.OwnerClientId);
+        if (!counted)
+        {
+            PracticeHelpers.SendChatMessage(ui, ORANGE + "You already voted." + EC, clientId);
+            return;
+        }
+        if (finished)
+        {
+            // Result message is broadcast by GoalieVote.Finish() itself.
+            return;
+        }
+        PracticeHelpers.SendChatMessage(ui, WHITE + $"Vote progress: {GoalieVote.CurrentYes}/{GoalieVote.Needed} yes ({(int)GoalieVote.SecondsRemaining}s left)" + EC);
+    }
+
     private static bool HandleDummyCommand(UIChat ui, ulong clientId, PlayerTeam team)
     {
         try
         {
             bool isRed = team == PlayerTeam.Red;
-            Player existingDummy = isRed ? MaxPracticePlugin.RedTeamDummy : MaxPracticePlugin.BlueTeamDummy;
-            
-            if (existingDummy != null && existingDummy.NetworkObject != null && existingDummy.NetworkObject.IsSpawned)
-            {
-                MaxPracticePlugin.FakePlayers.Remove(existingDummy);
-                existingDummy.NetworkObject.Despawn(true);
-                if (isRed)
-                    MaxPracticePlugin.RedTeamDummy = null;
-                else
-                    MaxPracticePlugin.BlueTeamDummy = null;
-                PracticeHelpers.SendChatMessage(ui, GREEN + $"{(isRed ? "Red" : "Blue")} dummy goalie removed!" + EC, clientId);
-                return false;
-            }
-            
-            // Check if a real goalie is already on this team
-            var nm = NetworkManager.Singleton;
-            if (nm != null)
-            {
-                foreach (var client in nm.ConnectedClientsList)
-                {
-                    var p = client?.PlayerObject?.GetComponent<Player>();
-                    if (p == null) continue;
-                    if (MaxPracticePlugin.FakePlayers.Contains(p)) continue;
-                    
-                    if (PracticeHelpers.GetPlayerRole(p) == PlayerRole.Goalie && PracticeHelpers.GetPlayerTeam(p) == team)
-                    {
-                        PracticeHelpers.SendChatMessage(ui, RED + $"Cannot spawn {(isRed ? "red" : "blue")} dummy - a real goalie is already on that team!" + EC, clientId);
-                        return false;
-                    }
-                }
-            }
 
-            var playerManager = MonoBehaviourSingleton<PlayerManager>.Instance;
-            if (playerManager == null)
+            // Toggle: if AI goalie exists for this team, despawn it.
+            if ((isRed ? MaxPracticePlugin.RedTeamDummy : MaxPracticePlugin.BlueTeamDummy) != null)
             {
-                PracticeHelpers.SendChatMessage(ui, RED + "PlayerManager not found!" + EC, clientId);
+                if (GoalieAIManager.DespawnAIGoalie(team))
+                    PracticeHelpers.SendChatMessage(ui, GREEN + $"{(isRed ? "Red" : "Blue")} dummy goalie removed!" + EC, clientId);
                 return false;
             }
 
-            var playerPrefabField = typeof(PlayerManager).GetField("playerPrefab", BindingFlags.NonPublic | BindingFlags.Instance);
-            Player playerPrefab = (Player)playerPrefabField?.GetValue(playerManager);
-            if (playerPrefab == null)
+            // Refuse if a real goalie already occupies that slot.
+            if (PracticeHelpers.HasRealGoalieOnTeam(team))
             {
-                PracticeHelpers.SendChatMessage(ui, RED + "playerPrefab not found!" + EC, clientId);
+                PracticeHelpers.SendChatMessage(ui, RED + $"Cannot spawn {(isRed ? "red" : "blue")} dummy - a real goalie is already on that team!" + EC, clientId);
                 return false;
             }
 
-            Player botPlayer = UnityEngine.Object.Instantiate(playerPrefab);
-            NetworkObject netObj = botPlayer.GetComponent<NetworkObject>();
-
-            ulong fakeClientId = 1111111UL + (ulong)(isRed ? 1 : 0);
-            netObj.SpawnWithOwnership(fakeClientId, true);
-
-            botPlayer.Username.Value = new Unity.Collections.FixedString32Bytes(isRed ? "DummyRed" : "DummyBlue");
-            botPlayer.SteamId.Value = new Unity.Collections.FixedString32Bytes(isRed ? "DummyRed" : "DummyBlue"); // Set SteamId for filtering
-            botPlayer.Server_SetGameState(phase: null, team: team, role: PlayerRole.Goalie, delay: 0f);
-            botPlayer.Number.Value = 62;
-            // B310: Cosmetics are now int-based IDs - but properties don't exist in current build
-            // try { botPlayer.GoalieRedSkinID.Value = 0; } catch (Exception) { }
-            // try { botPlayer.GoalieBlueSkinID.Value = 0; } catch (Exception) { }
-
-            Vector3 goalPos = isRed ? new Vector3(0f, 0f, -40.23f) : new Vector3(0f, 0f, 40.23f);
-            Vector3 spawnPos = goalPos;
-            spawnPos.z += isRed ? 1.5f : -1.5f;
-            spawnPos.y = 0f;
-
-            Quaternion spawnRot = Quaternion.LookRotation(isRed ? Vector3.forward : Vector3.back);
-            botPlayer.Server_SpawnCharacter(spawnPos, spawnRot, PlayerRole.Goalie);
-
-            MaxPracticePlugin.FakePlayers.Add(botPlayer);
-            if (isRed)
-                MaxPracticePlugin.RedTeamDummy = botPlayer;
+            if (GoalieAIManager.SpawnAIGoalie(team))
+                PracticeHelpers.SendChatMessage(ui, GREEN + $"{(isRed ? "Red" : "Blue")} AI goalie spawned!" + EC, clientId);
             else
-                MaxPracticePlugin.BlueTeamDummy = botPlayer;
-
-            SimpleGoalieAI ai = botPlayer.gameObject.AddComponent<SimpleGoalieAI>();
-            ai.controlledPlayer = botPlayer;
-            ai.team = team;
-
-            // Chat disabled for B310 API compatibility
-            // ui.Server_SendSystemChatMessage(GREEN + $"{(isRed ? "Red" : "Blue")} AI goalie spawned!" + EC, clientId);
+                PracticeHelpers.SendChatMessage(ui, RED + "Failed to spawn AI goalie (see server log)." + EC, clientId);
         }
         catch (Exception ex)
         {
-            // Chat disabled for B310 API compatibility
-            // ui.Server_SendSystemChatMessage(RED + "Error: " + ex.Message + EC, clientId);
             Debug.LogError("Dummy spawn error: " + ex.ToString());
         }
-        
+
         return false;
     }
 }
