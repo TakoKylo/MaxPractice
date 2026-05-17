@@ -1100,7 +1100,7 @@ namespace MaxPractice
         /// shooting at the goalie and expects sweeps. In actual games, it's true when ANY
         /// non-AI opposing player is within DangerRange of the puck.
         /// </summary>
-        private const float DangerRange = 10f;
+        private const float DangerRange = 25f;
         private bool IsPuckDangerous(Vector3 puckPos)
         {
             // Practice override: in warmup, every shot is "dangerous" so the goalie always sweeps.
