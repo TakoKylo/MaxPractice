@@ -384,6 +384,15 @@ namespace MaxPractice
         /// </summary>
         public static void OnGoalScored(PlayerTeam scoringTeam)
         {
+            // No emotes during warmup — the goalie is a practice dummy and should stay ready,
+            // not fall over or jump around when the user is trying to work on their shot.
+            try
+            {
+                var gm = NetworkBehaviourSingleton<GameManager>.Instance;
+                if (gm != null && gm.Phase == GamePhase.Warmup) return;
+            }
+            catch { }
+
             // Scored-on team's goalie: sad reaction. Scoring team's goalie: excited celebration.
             if (scoringTeam == PlayerTeam.Blue)
             {
