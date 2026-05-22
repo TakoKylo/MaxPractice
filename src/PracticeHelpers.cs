@@ -102,7 +102,7 @@ namespace MaxPractice
                     if (pending.ClientId == 0UL)
                         chatManager.Server_BroadcastChatMessage(pending.Content);
                     else
-                        chatManager.Server_SendChatMessage(pending.Content, null, pending.ClientId);
+                        chatManager.Server_SendChatMessage(pending.Content, null, new ulong[] { pending.ClientId });
                 }
                 catch { }
             }
