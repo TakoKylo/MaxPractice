@@ -58,8 +58,8 @@ namespace MaxPractice
         // FlushPendingChats drains it once a frame from PracticeManager.Update on the main
         // thread, after NetworkManager.Singleton.IsServer is verified).
         //
-        // Uses the STRING overload of ChatManager.Server_BroadcastChatMessage /
-        // Server_SendChatMessageToClients — the same path OpenWorldPracticeMod uses. The
+        // Uses the STRING overloads of ChatManager.Server_BroadcastChatMessage /
+        // Server_SendChatMessage — the same path OpenWorldPracticeMod uses. The
         // ChatMessage-struct overload would let us set Username/SteamID/etc, but with those
         // fields null the client-side AddChatMessage drops the message silently. The string
         // overloads build a proper system ChatMessage server-side and ship it intact.
@@ -102,7 +102,7 @@ namespace MaxPractice
                     if (pending.ClientId == 0UL)
                         chatManager.Server_BroadcastChatMessage(pending.Content);
                     else
-                        chatManager.Server_SendChatMessageToClients(pending.Content, new[] { pending.ClientId });
+                        chatManager.Server_SendChatMessage(pending.Content, null, pending.ClientId);
                 }
                 catch { }
             }

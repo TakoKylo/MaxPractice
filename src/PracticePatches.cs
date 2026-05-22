@@ -945,87 +945,96 @@ public static class UIChat_AutoShow_Patch
 // ============================================================================
 
 /// <summary>
-/// Patch the Vote calculation to be aware of fake players (AI goalies and traffic dummies).
-/// Instead of patching the event handler, we patch VoteManager.Server_CreateVote to correct votesNeeded.
+/// Patch VoteManager.Server_AddVote to (a) block /vs and /vw on practice-only
+/// servers when DisableVoting=true, and (b) reduce requiredVotes to exclude
+/// fake players (AI goalies, traffic dummies) so a vote isn't stuck waiting
+/// for non-existent humans.
+///
+/// API note: pre-B324 this was Server_CreateVote(VoteType, ref votesNeeded, ...).
+/// The new API uses string names ("start"/"warmup"/"kick"/"forfeit") and the
+/// caller pre-computes requiredVotes via Utils.GetVoteMajority. We override
+/// after counting fakes in the vote's `teams`, reusing the game's own
+/// majority formula so behavior matches what humans expect.
 /// </summary>
-[HarmonyPatch(typeof(VoteManager), "Server_CreateVote")]
-public static class VoteManager_Server_CreateVote_Patch
+[HarmonyPatch(typeof(VoteManager), "Server_AddVote")]
+public static class VoteManager_Server_AddVote_Patch
 {
     [HarmonyPrefix]
     [HarmonyPriority(Priority.First)]
-    public static bool Prefix(VoteManager __instance, VoteType voteType, ref int votesNeeded, Player startedBy, object data = null)
+    public static bool Prefix(string name, string title, string description, PlayerTeam[] teams, float timeout, string steamId, ref int requiredVotes, object data = null)
     {
         try
         {
-            // Only run on server
-            if (!NetworkManager.Singleton.IsServer)
+            if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer)
                 return true;
 
-            // DisableVoting blocks /vs and /vw entirely on practice-only servers.
-            // /vk (Kick) is intentionally left alone — it's a moderation tool,
-            // not a way to start games. VoteManagerController.cs:36-61 shows
-            // both /vs and /vw funnel through here as VoteType.Start/Warmup.
-            if (ConfigManager.Config.DisableVoting &&
-                (voteType == VoteType.Start || voteType == VoteType.Warmup))
+            if (ConfigManager.Config.DisableVoting && (name == "start" || name == "warmup"))
             {
                 try
                 {
-                    ulong clientId = startedBy != null && startedBy.NetworkObject != null
-                        ? startedBy.NetworkObject.OwnerClientId
-                        : 0UL;
-                    if (clientId != 0UL)
+                    if (!string.IsNullOrEmpty(steamId))
                     {
-                        PracticeHelpers.SendMessageToPlayer(
-                            clientId,
-                            "<size=70%><color=#FF6666>Game-start voting is disabled on this practice server.</color></size>");
+                        var pm = MonoBehaviourSingleton<PlayerManager>.Instance;
+                        if (pm != null)
+                        {
+                            foreach (var p in pm.GetPlayers(false))
+                            {
+                                if (p != null && p.NetworkObject != null &&
+                                    p.SteamId.Value.ToString() == steamId)
+                                {
+                                    PracticeHelpers.SendMessageToPlayer(
+                                        p.NetworkObject.OwnerClientId,
+                                        "<size=70%><color=#FF6666>Game-start voting is disabled on this practice server.</color></size>");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 catch { }
-                Debug.Log($"[MaxPractice] Blocked {voteType} vote (DisableVoting=true)");
-                return false; // skip original — vote never created
+                Debug.Log($"[MaxPractice] Blocked {name} vote (DisableVoting=true)");
+                return false;
             }
 
-            // If no fake players, let it pass through unchanged
             if (MaxPracticePlugin.FakePlayers.Count == 0)
                 return true;
 
-            Debug.Log($"[MaxPractice] Detected vote creation with votesNeeded={votesNeeded}");
-
-            // Get real player count by excluding fake players
             var playerManager = MonoBehaviourSingleton<PlayerManager>.Instance;
             if (playerManager == null)
                 return true;
 
-            var allPlayers = playerManager.GetPlayers(false);
+            // Match the caller's population: kick/forfeit pass a single team, start/warmup pass both.
+            var votingPlayers = teams != null && teams.Length > 0
+                ? playerManager.GetPlayersByTeams(teams)
+                : playerManager.GetPlayers(false);
+
             int fakeCount = 0;
-
-            // Count EVERY fake player present (goalie AI + traffic + passers).
-            // The detector identifies them by client ID range / username, so we
-            // don't double-count entries that are also in FakePlayers.
-            foreach (var player in allPlayers)
+            foreach (var p in votingPlayers)
             {
-                if (FakePlayerDetector.IsAnyFakePlayer(player))
-                    fakeCount++;
+                if (FakePlayerDetector.IsAnyFakePlayer(p)) fakeCount++;
             }
-
             if (fakeCount == 0)
-                return true; // No fake players detected
+                return true;
 
-            Debug.Log($"[MaxPractice] Found {fakeCount} fake players out of {allPlayers.Count} total");
-
-            // Recalculate votesNeeded: subtract EACH fake player from the count
-            int realPlayerCount = allPlayers.Count - fakeCount;
+            int realPlayerCount = votingPlayers.Count - fakeCount;
             if (realPlayerCount < 1) realPlayerCount = 1;
 
-            int correctedVotesNeeded = UnityEngine.Mathf.RoundToInt((float)realPlayerCount / 2f + 0.5f);
-            if (correctedVotesNeeded < 1) correctedVotesNeeded = 1;
+            // Mirror Utils.GetVoteMajority so the threshold matches the game's own rule.
+            int corrected;
+            switch (realPlayerCount)
+            {
+                case 1: corrected = 1; break;
+                case 2: corrected = 2; break;
+                default: corrected = UnityEngine.Mathf.CeilToInt((float)(realPlayerCount - 1) * 0.75f); break;
+            }
+            if (corrected < 1) corrected = 1;
 
-            Debug.Log($"[MaxPractice] Correcting votesNeeded: {votesNeeded} → {correctedVotesNeeded} (real players: {realPlayerCount})");
-            votesNeeded = correctedVotesNeeded;
+            Debug.Log($"[MaxPractice] Correcting {name} vote requiredVotes: {requiredVotes} → {corrected} (real:{realPlayerCount}, fakes:{fakeCount})");
+            requiredVotes = corrected;
         }
         catch (System.Exception ex)
         {
-            Debug.LogError($"[MaxPractice] VoteManager.Server_CreateVote patch error: {ex.Message}\n{ex.StackTrace}");
+            Debug.LogError($"[MaxPractice] VoteManager.Server_AddVote patch error: {ex.Message}\n{ex.StackTrace}");
         }
         return true;
     }

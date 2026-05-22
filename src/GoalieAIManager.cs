@@ -589,11 +589,11 @@ namespace MaxPractice
         /// <summary>
         /// Suppress "has joined/left the server" chat for AI goalies.
         /// </summary>
-        [HarmonyPatch(typeof(ChatManager), nameof(ChatManager.Server_BroadcastChatMessage), new[] { typeof(string) })]
+        [HarmonyPatch(typeof(ChatManager), nameof(ChatManager.Server_BroadcastChatMessage), new[] { typeof(string), typeof(string) })]
         public static class SuppressBotChatMessagesPatch
         {
             [HarmonyPrefix]
-            public static bool Prefix(string content)
+            public static bool Prefix(string content, string color)
             {
                 if (content == null) return true;
                 if ((content.Contains(RedBotName) || content.Contains(BlueBotName)) &&
@@ -607,7 +607,7 @@ namespace MaxPractice
 
         /// <summary>
         /// Filter AI goalies from PlayerManager.GetPlayers() (vote counts, pause logic, etc).
-        /// PracticePatches.VoteManager_Server_CreateVote_Patch already handles vote-needed
+        /// PracticePatches.VoteManager_Server_AddVote_Patch already handles vote-needed
         /// counts via the FakePlayers HashSet, so this is mostly belt-and-suspenders.
         /// </summary>
         [HarmonyPatch(typeof(PlayerManager), nameof(PlayerManager.GetPlayers))]
