@@ -970,28 +970,6 @@ public static class VoteManager_Server_AddVote_Patch
 
             if (ConfigManager.Config.DisableVoting && (name == "start" || name == "warmup"))
             {
-                try
-                {
-                    if (!string.IsNullOrEmpty(steamId))
-                    {
-                        var pm = MonoBehaviourSingleton<PlayerManager>.Instance;
-                        if (pm != null)
-                        {
-                            foreach (var p in pm.GetPlayers(false))
-                            {
-                                if (p != null && p.NetworkObject != null &&
-                                    p.SteamId.Value.ToString() == steamId)
-                                {
-                                    PracticeHelpers.SendMessageToPlayer(
-                                        p.NetworkObject.OwnerClientId,
-                                        "<size=70%><color=#FF6666>Game-start voting is disabled on this practice server.</color></size>");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                catch { }
                 Debug.Log($"[MaxPractice] Blocked {name} vote (DisableVoting=true)");
                 return false;
             }

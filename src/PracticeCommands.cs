@@ -163,7 +163,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableInfiniteStamina)
                 {
-                    SendPrivate(ui, clientId, RED + "Infinite stamina is disabled on this server." + EC);
                     return false;
                 }
                 if (MaxPracticePlugin.InfiniteStaminaPlayers.Contains(senderSteam))
@@ -184,7 +183,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableYoyo)
                 {
-                    SendPrivate(ui, clientId, RED + "Yoyo is disabled on this server." + EC);
                     return false;
                 }
                 if (MaxPracticePlugin.YoyoPlayers.Contains(senderSteam))
@@ -205,7 +203,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableSpawnPuck)
                 {
-                    SendPrivate(ui, clientId, RED + "Spawn puck is disabled on this server." + EC);
                     return false;
                 }
                 float currentTime = Time.realtimeSinceStartup;
@@ -242,7 +239,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableBackpass)
                 {
-                    SendPrivate(ui, clientId, RED + "Backpass is disabled on this server." + EC);
                     return false;
                 }
                 float currentTime = Time.realtimeSinceStartup;
@@ -314,7 +310,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnablePass)
                 {
-                    SendPrivate(ui, clientId, RED + "Pass is disabled on this server." + EC);
                     return false;
                 }
                 if (!PracticeHelpers.IsCharacterSpawned(player) || player.Stick == null || player.PlayerBody == null)
@@ -393,7 +388,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableTapCommands)
                 {
-                    SendPrivate(ui, clientId, RED + "Tap commands are disabled on this server." + EC);
                     return false;
                 }
                 // Check if already enabled - toggle off
@@ -438,7 +432,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableTapCommands)
                 {
-                    SendPrivate(ui, clientId, RED + "Tap commands are disabled on this server." + EC);
                     return false;
                 }
                 if (MaxPractice.YoyoManager.TapSpawnPlayers.Contains(senderSteam))
@@ -464,7 +457,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableTapCommands)
                 {
-                    SendPrivate(ui, clientId, RED + "Tap commands are disabled on this server." + EC);
                     return false;
                 }
                 if (MaxPractice.YoyoManager.TapYoyoPlayers.Contains(senderSteam))
@@ -494,7 +486,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableTapCommands)
                 {
-                    SendPrivate(ui, clientId, RED + "Tap commands are disabled on this server." + EC);
                     return false;
                 }
                 if (MaxPractice.YoyoManager.TapBackpassPlayers.Contains(senderSteam))
@@ -520,7 +511,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableTraffic)
                 {
-                    SendPrivate(ui, clientId, RED + "Traffic is disabled on this server." + EC);
                     return false;
                 }
                 var gameMgr = NetworkBehaviourSingleton<GameManager>.Instance;
@@ -571,7 +561,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableTraffic)
                 {
-                    SendPrivate(ui, clientId, RED + "Traffic is disabled on this server." + EC);
                     return false;
                 }
                 var gameMgr = NetworkBehaviourSingleton<GameManager>.Instance;
@@ -679,14 +668,12 @@ public static class PracticeCommandPatch
             // /clearpasser - passer AI is disabled in B310, but keep the command reserved to avoid chat spam.
             if (cmd == "/clearpasser" || cmd.StartsWith("/clearpasser"))
             {
-                SendPrivate(ui, clientId, ORANGE + "Passer AI is disabled in this B310 build." + EC);
                 return false;
             }
 
             // /passer - disabled for B310
             if (cmd == "/passer")
             {
-                SendPrivate(ui, clientId, ORANGE + "Passer AI is disabled in this B310 build." + EC);
                 return false;
             }
 
@@ -826,7 +813,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableDummy)
                 {
-                    SendPrivate(ui, clientId, RED + "Goalie AI commands are disabled on this server." + EC);
                     return false;
                 }
                 return HandleDummyCommand(ui, clientId, PlayerTeam.Red);
@@ -837,7 +823,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableDummy)
                 {
-                    SendPrivate(ui, clientId, RED + "Goalie AI commands are disabled on this server." + EC);
                     return false;
                 }
                 return HandleDummyCommand(ui, clientId, PlayerTeam.Blue);
@@ -848,7 +833,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableDummy)
                 {
-                    SendPrivate(ui, clientId, RED + "Goalie AI commands are disabled on this server." + EC);
                     return false;
                 }
                 
@@ -886,7 +870,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableCones)
                 {
-                    SendPrivate(ui, clientId, RED + "Handle commands are disabled on this server." + EC);
                     return false;
                 }
                 
@@ -965,7 +948,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableMinefield)
                 {
-                    SendPrivate(ui, clientId, RED + "Handle commands are disabled on this server." + EC);
                     return false;
                 }
                 
@@ -1040,7 +1022,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnablePop)
                 {
-                    SendPrivate(ui, clientId, RED + "Pop is disabled on this server." + EC);
                     return false;
                 }
                 if (MaxPractice.YoyoManager.PopLastTouchedPuckForPlayer(player) ||
@@ -1061,7 +1042,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableSavePrac)
                 {
-                    SendPrivate(ui, clientId, RED + "Save practice is disabled on this server." + EC);
                     return false;
                 }
                 // Only goalies can use saveprac
@@ -1131,7 +1111,6 @@ public static class PracticeCommandPatch
             {
                 if (!cfg.EnableTipPrac)
                 {
-                    SendPrivate(ui, clientId, RED + "Tip practice is disabled on this server." + EC);
                     return false;
                 }
                 if (MaxPracticePlugin.ActiveTipPracSessions.TryGetValue(senderSteam, out var existingCoroutine))
@@ -1206,12 +1185,10 @@ public static class PracticeCommandPatch
         // - DisableVoting: global vote killswitch shared with /vs and /vw.
         if (!cfg.EnableGoalieVoting)
         {
-            PracticeHelpers.SendChatMessage(ui, RED + "Mid-game AI goalie voting is disabled on this server." + EC, clientId);
             return;
         }
         if (cfg.DisableVoting)
         {
-            PracticeHelpers.SendChatMessage(ui, RED + "Voting is disabled on this server." + EC, clientId);
             return;
         }
 
