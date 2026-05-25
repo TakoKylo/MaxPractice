@@ -23,12 +23,12 @@
 
     <!--
       Reference EVERY DLL from the live game's Managed folder so we always
-      build against the current build (B323). Local libs/ is kept only for
+      build against the current build (b897). Local libs/ is kept only for
       a few packages the game doesn't ship (SocketIO, etc).
 
       Past pitfall: libs/ used to contain stale copies of every game DLL
       from B202, which silently shadowed live references and made the mod
-      build against IPuckMod (B202) instead of IPuckPlugin (B323+) — so the
+      build against IPuckMod (B202) instead of IPuckPlugin (b323+) — so the
       server's mod loader couldn't find a plugin and the mod never loaded.
     -->
     <ItemGroup>

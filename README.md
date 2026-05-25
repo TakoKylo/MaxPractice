@@ -3,7 +3,7 @@
 A server-side practice mod for [Puck](https://store.steampowered.com/app/2994020/). Adds chat commands for save practice, stickhandling drills, puck spawning, traffic dummies, AI goalies, and more — all server-authored so clients only need the standard public mod.
 
 **Steam Workshop:** https://steamcommunity.com/sharedfiles/filedetails/?id=3646785422
-**Build target:** Puck B323
+**Build target:** Puck b897
 **Type:** Server-sided plugin (clients connecting to a modded server get it automatically via mod sync)
 
 ---
@@ -144,7 +144,7 @@ The csproj auto-references every DLL in `<puck-install>/Puck_Data/Managed`, so t
 ### Target
 
 - **Framework:** .NET Framework 4.8
-- **Plugin interface:** `IPuckPlugin` (B323+)
+- **Plugin interface:** `IPuckPlugin` (b323+, unchanged in b897)
 
 Plain `libs/` only contains a few non-game packages (SocketIO, Unity addons). Do **not** put game DLLs there — they'll shadow the live `Managed/` references and the mod will silently build against stale B202 APIs.
 
@@ -152,7 +152,7 @@ Plain `libs/` only contains a few non-game packages (SocketIO, Unity addons). Do
 
 ## Acknowledgements
 
-The goalie AI was adapted from the [ToastersRinkSuite](https://github.com/) reference implementation. Behavior structure (butterfly/standing decision tree, idle fidgets, intermission behaviors, dash overshoot braking, look-RPC replication via `NetworkingUtils.CompressFloatToShort`) is ported 1:1 with B323 API adaptations and MaxPractice integration.
+The goalie AI was adapted from the [ToastersRinkSuite](https://github.com/) reference implementation. Behavior structure (butterfly/standing decision tree, idle fidgets, intermission behaviors, dash overshoot braking, look-RPC replication via `NetworkingUtils.CompressFloatToShort`) is ported 1:1 with b323+/b897 API adaptations and MaxPractice integration.
 
 ## Support
 

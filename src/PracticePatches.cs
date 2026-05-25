@@ -950,7 +950,7 @@ public static class UIChat_AutoShow_Patch
 /// fake players (AI goalies, traffic dummies) so a vote isn't stuck waiting
 /// for non-existent humans.
 ///
-/// API note: pre-B324 this was Server_CreateVote(VoteType, ref votesNeeded, ...).
+/// API note: pre-b897 this was Server_CreateVote(VoteType, ref votesNeeded, ...).
 /// The new API uses string names ("start"/"warmup"/"kick"/"forfeit") and the
 /// caller pre-computes requiredVotes via Utils.GetVoteMajority. We override
 /// after counting fakes in the vote's `teams`, reusing the game's own
