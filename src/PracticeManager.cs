@@ -93,9 +93,17 @@ public class PracticeManager : MonoBehaviour
             // Get steamId using helper method (handles FixedString conversion)
             ulong steamId = PracticeHelpers.GetSteamIdFromPlayer(player);
             if (steamId == 0) return;
-            
+
             // Clean up traffic owned by this player
             MaxPracticePlugin.CleanupPlayerTraffic(steamId);
+
+            // Wipe per-player command/yoyo state so HashSets/Dicts don't accumulate
+            // dead entries over a long-running server session. Pass both keys —
+            // entries may have been written under either depending on whether
+            // GetSteamIdFromPlayer resolved to OwnerClientId or SteamId.
+            MaxPracticePlugin.CleanupPlayerState(steamId, clientId);
+            if (YoyoManager.Instance != null)
+                YoyoManager.Instance.CleanupForPlayer(steamId, clientId);
         }
         catch (Exception) { }
     }

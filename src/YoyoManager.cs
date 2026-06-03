@@ -93,21 +93,26 @@ namespace MaxPractice
         }
         
         /// <summary>
-        /// Tracks stick position/velocity for yank detection
+        /// Tracks stick position/velocity for yank detection. Velocity is measured in
+        /// PlayerBody-local space so the player's own skating/spinning velocity drops
+        /// out of the yank signal — only the stick's motion relative to the body
+        /// counts. World-space LastPosition is kept for distance-to-puck checks.
         /// </summary>
         private class StickTracker
         {
-            public Vector3 LastPosition;
-            public Vector3 Velocity;
+            public Vector3 LastPosition;       // world-space blade position (for distance checks)
+            public Vector3 LastLocalPosition;  // PlayerBody-local blade position (for velocity)
+            public Vector3 LocalVelocity;      // body-relative blade velocity
             public float LastUpdateTime;
-            
-            public void Update(Vector3 newPos, float deltaTime)
+
+            public void Update(Vector3 worldPos, Vector3 localPos, float deltaTime)
             {
                 if (deltaTime > 0.001f)
                 {
-                    Velocity = (newPos - LastPosition) / deltaTime;
+                    LocalVelocity = (localPos - LastLocalPosition) / deltaTime;
                 }
-                LastPosition = newPos;
+                LastPosition = worldPos;
+                LastLocalPosition = localPos;
                 LastUpdateTime = Time.time;
             }
         }
@@ -133,12 +138,15 @@ namespace MaxPractice
                 Instance = null;
         }
         
-        // Throttling for Update
+        // Throttling for Update. 60Hz: the yank gesture is short (~80–150ms);
+        // 30Hz risked missing the velocity peak between samples.
         private float _nextUpdateTime = 0f;
-        private const float UPDATE_INTERVAL = 0.033f; // ~30fps is enough for yank detection
-        
-        // Reusable list to avoid allocations
+        private const float UPDATE_INTERVAL = 0.0166f;
+
+        // Reusable lists to avoid per-frame allocations.
         private List<ulong> _toRemoveCache = new List<ulong>();
+        private List<ulong> _ownerCache = new List<ulong>();
+        private List<ulong> _detachCache = new List<ulong>();
         
         void Update()
         {
@@ -493,16 +501,18 @@ namespace MaxPractice
             foreach (var steamId in MaxPracticePlugin.YoyoPlayers)
             {
                 Player player = PracticeHelpers.FindPlayerBySteamId(steamId);
-                if (player == null || player.Stick == null) continue;
-                
-                Vector3 stickPos = GetBladePosition(player);
-                
+                if (player == null || player.Stick == null || player.PlayerBody == null) continue;
+
+                Vector3 stickWorldPos = GetBladePosition(player);
+                Vector3 stickLocalPos = player.PlayerBody.transform.InverseTransformPoint(stickWorldPos);
+
                 if (!playerStickTrackers.TryGetValue(steamId, out StickTracker tracker))
                 {
                     tracker = new StickTracker
                     {
-                        LastPosition = stickPos,
-                        Velocity = Vector3.zero,
+                        LastPosition = stickWorldPos,
+                        LastLocalPosition = stickLocalPos,
+                        LocalVelocity = Vector3.zero,
                         LastUpdateTime = Time.time
                     };
                     playerStickTrackers[steamId] = tracker;
@@ -510,7 +520,7 @@ namespace MaxPractice
                 else
                 {
                     float dt = Time.time - tracker.LastUpdateTime;
-                    tracker.Update(stickPos, dt);
+                    tracker.Update(stickWorldPos, stickLocalPos, dt);
                 }
             }
         }
@@ -569,41 +579,40 @@ namespace MaxPractice
                 Vector3 puckPos = puck.transform.position;
                 Vector3 playerPos = player.PlayerBody.transform.position;
                 Vector3 stickPos = tracker.LastPosition;
-                
+
                 // Check delay after puck was touched (prevents follow-through)
                 if (puckTouchTime.TryGetValue(steamId, out float touchTime))
                 {
                     if (Time.time - touchTime < PracticeConstants.YoyoDelayAfterShot)
                         continue; // Not enough time since shot
                 }
-                
+
                 // Check minimum distance from STICK BLADE
                 float distFromStick = Vector3.Distance(puckPos, stickPos);
                 if (distFromStick < PracticeConstants.YoyoMinDistanceFromStick)
                     continue; // Puck is too close to stick
-                
-                // Check stick velocity
-                Vector3 stickVel = tracker.Velocity;
-                float stickSpeed = stickVel.magnitude;
-                
-                if (stickSpeed < PracticeConstants.YoyoYankSpeedThreshold)
-                    continue; // Stick not moving fast enough
-                
-                // Key check: stick must be moving TOWARD the player (pulling back), not away
-                // This is what defines a "yank" - pulling the stick back toward your body
-                Vector3 stickToPlayer = (playerPos - stickPos).normalized;
-                float stickMovingTowardPlayer = Vector3.Dot(stickVel.normalized, stickToPlayer);
-                
-                if (stickMovingTowardPlayer > 0.3f)
+
+                // Body-relative stick motion. Working in PlayerBody-local space removes the
+                // player's own skating/spinning velocity from the signal: a real yank moves
+                // the stick toward the body origin regardless of how the body is translating.
+                Vector3 localVel = tracker.LocalVelocity;
+                float localSpeed = localVel.magnitude;
+                if (localSpeed < PracticeConstants.YoyoYankSpeedThreshold)
+                    continue;
+
+                // "Toward player" in local space = toward the body origin.
+                Vector3 stickToBodyLocal = (-tracker.LastLocalPosition).normalized;
+                float towardPlayer = Vector3.Dot(localVel.normalized, stickToBodyLocal);
+
+                if (towardPlayer > 0.3f)
                 {
-                    // YANK DETECTED! Stick is pulling back toward player
+                    // YANK DETECTED — stick pulled back toward body.
                     lastYankTime[steamId] = Time.time;
                     puckReturning[puck] = true;
-                    
-                    // Calculate return speed
+
                     float distFromPlayer = Vector3.Distance(puckPos, playerPos);
                     float returnSpeed = Mathf.Clamp(18f + distFromPlayer, 18f, 35f);
-                    
+
                     LaunchPuckToPlayer(puck, player, steamId, returnSpeed);
                 }
             }
@@ -624,13 +633,16 @@ namespace MaxPractice
         private void LaunchPuckToPlayer(Puck puck, Player player, ulong steamId, float speed = 25f, bool highArc = false)
         {
             if (puck?.Rigidbody == null || player?.PlayerBody == null) return;
-            
+
             var rb = puck.Rigidbody;
             Vector3 startPos = puck.transform.position;
-            
-            // Predict target position based on player BODY movement
-            Vector3 targetPos = PredictStickPosition(player);
-            
+
+            // Predict target position based on player BODY movement, scaled by the
+            // actual flight time (puck distance ÷ launch speed) rather than a fixed
+            // 10m assumption.
+            float flightDistance = Vector3.Distance(startPos, player.PlayerBody.transform.position);
+            Vector3 targetPos = PredictStickPosition(player, flightDistance, speed);
+
             // Calculate ballistic launch velocity
             Vector3? launchVel = CalculateBallisticVelocity(startPos, targetPos, speed, highArc);
             
@@ -649,30 +661,27 @@ namespace MaxPractice
         }
         
         /// <summary>
-        /// Predict where the stick will be based on player body velocity
+        /// Predict where the stick will be when the puck arrives. Lead time is
+        /// (distance ÷ speed) so the prediction scales with how far the puck
+        /// has to travel — fixes a stale 10m / 25 m·s⁻¹ hardcode that produced
+        /// off-target leads on short or long shots.
         /// </summary>
-        private Vector3 PredictStickPosition(Player player)
+        private Vector3 PredictStickPosition(Player player, float distance = 10f, float speed = 25f)
         {
             Vector3 bladePos = GetBladePosition(player);
-            
+
             if (player.PlayerBody == null) return bladePos;
-            
+
             var bodyRb = player.PlayerBody.GetComponent<Rigidbody>();
             if (bodyRb == null) return bladePos;
-            
-            // Get player body velocity
+
             Vector3 playerVelocity = bodyRb.linearVelocity;
-            
-            // Estimate time for puck to arrive (rough estimate based on distance)
-            float distance = 10f; // Assume average distance
-            float estimatedTime = distance / 25f; // Assume ~25 speed
-            
-            // Predict future position
-            Vector3 predictedPos = bladePos + playerVelocity * estimatedTime * 0.7f; // 0.7 factor for some damping
-            
-            // Keep Y at blade height (don't predict vertical movement much)
+            float estimatedTime = speed > 0.1f ? distance / speed : 0.4f;
+
+            // 0.7 damping keeps the prediction conservative — overshooting feels worse
+            // than slightly trailing, since trailing pucks still meet the stick.
+            Vector3 predictedPos = bladePos + playerVelocity * estimatedTime * 0.7f;
             predictedPos.y = bladePos.y;
-            
             return predictedPos;
         }
         
@@ -768,92 +777,80 @@ namespace MaxPractice
         {
             if (puck == null || puck.Rigidbody == null) return;
             if (!MaxPracticePlugin.YoyoPlayers.Contains(steamId)) return;
-            
+
             var gm = GameManager.Instance;
             if (gm == null || gm.Phase != GamePhase.Warmup) return;
-            
-            // Check if this is already our tracked puck
+
+            // Already tracking this exact puck for this player — just refresh touch time
+            // (skip the refresh if the puck is mid-return, so the post-shot delay timer
+            // doesn't reset when the player catches their own incoming puck).
             if (playerYoyoPucks.TryGetValue(steamId, out Puck currentPuck) && currentPuck == puck)
             {
-                // Already tracking this puck - only update touch time if puck was NOT returning
-                // This prevents resetting the delay timer when catching a returning puck
                 if (!puckReturning.TryGetValue(puck, out bool isReturning) || !isReturning)
-                {
                     puckTouchTime[steamId] = Time.time;
-                }
-                // Reset returning state since player touched it
                 puckReturning[puck] = false;
                 return;
             }
-            
-            // Remove old puck tracking
+
+            // This player previously tracked a different puck — release it.
             if (currentPuck != null)
-            {
                 puckReturning.Remove(currentPuck);
+
+            // Strip this puck from every other player tracking it. Without this, two
+            // yoyo players touching the same puck both retain ownership and both
+            // yank-detection loops fire on the next gesture.
+            _detachCache.Clear();
+            foreach (var kvp in playerYoyoPucks)
+            {
+                if (kvp.Key != steamId && kvp.Value == puck)
+                    _detachCache.Add(kvp.Key);
             }
-            
-            // Track this new puck with current time
+            foreach (var otherSteamId in _detachCache)
+            {
+                playerYoyoPucks.Remove(otherSteamId);
+                puckTouchTime.Remove(otherSteamId);
+            }
+            _detachCache.Clear();
+
             playerYoyoPucks[steamId] = puck;
             puckTouchTime[steamId] = Time.time;
             puckReturning[puck] = false;
         }
         
         /// <summary>
-        /// Called when a player OTHER than the yoyo owner touches a puck.
-        /// If this puck was someone's yoyo puck, detach it from them.
-        /// If the toucher has yoyo enabled, the puck becomes theirs.
+        /// Called when a NON-yoyo player touches a puck. The collision patch already
+        /// routes yoyo touchers to OnPuckFired, so the call-site invariant here is
+        /// `toucherSteamId is not in YoyoPlayers`. We just need to detach the puck
+        /// from every current owner (defensive sweep — there should be at most one,
+        /// but historical multi-owner state would still get cleaned up).
         /// </summary>
         public void OnPuckTouchedByOther(Puck puck, ulong toucherSteamId)
         {
             if (puck == null) return;
-            
-            // Find who this puck belongs to
-            ulong ownerSteamId = 0;
+
+            _ownerCache.Clear();
             foreach (var kvp in playerYoyoPucks)
             {
-                if (kvp.Value == puck)
-                {
-                    ownerSteamId = kvp.Key;
-                    break;
-                }
+                if (kvp.Value == puck) _ownerCache.Add(kvp.Key);
             }
-            
-            // Don't do anything if the owner touched their own puck
-            if (ownerSteamId == toucherSteamId) return;
-            
-            // If puck is currently returning to its owner, don't let it be stolen
-            // This prevents accidental interceptions while puck is coming back
-            if (ownerSteamId != 0 && puckReturning.TryGetValue(puck, out bool isReturning) && isReturning)
+
+            // No one tracks this puck — nothing to detach.
+            if (_ownerCache.Count == 0) return;
+
+            // If puck is mid-return to its owner, don't let it be intercepted.
+            if (puckReturning.TryGetValue(puck, out bool isReturning) && isReturning)
             {
-                // Allow steal only if toucher also has yoyo enabled (intentional interception)
-                if (!MaxPracticePlugin.YoyoPlayers.Contains(toucherSteamId))
-                    return; // Don't detach - puck is returning to owner
-            }
-            
-            // If the toucher has yoyo enabled, give them this puck
-            if (MaxPracticePlugin.YoyoPlayers.Contains(toucherSteamId))
-            {
-                // Detach from old owner first (if any)
-                if (ownerSteamId != 0)
-                {
-                    playerYoyoPucks.Remove(ownerSteamId);
-                    puckTouchTime.Remove(ownerSteamId);
-                }
-                puckReturning.Remove(puck);
-                
-                // Give puck to new owner
-                OnPuckFired(puck, toucherSteamId);
+                _ownerCache.Clear();
                 return;
             }
-            
-            // If no one owns this puck, nothing more to do
-            if (ownerSteamId == 0) return;
-            
-            // Toucher doesn't have yoyo - detach puck from its owner
-            playerYoyoPucks.Remove(ownerSteamId);
-            puckTouchTime.Remove(ownerSteamId);
+
+            foreach (var ownerId in _ownerCache)
+            {
+                playerYoyoPucks.Remove(ownerId);
+                puckTouchTime.Remove(ownerId);
+            }
+            _ownerCache.Clear();
             puckReturning.Remove(puck);
-        
         }
         
         // Spawn a pass from saved position to player's current stick
@@ -997,6 +994,45 @@ namespace MaxPractice
             playerStickTrackers.Clear();
             lastYankTime.Clear();
             LastTouchedPuck.Clear();
+        }
+
+        /// <summary>
+        /// Wipe all per-player yoyo state. Called on disconnect. Tries both keys
+        /// (steamId and clientId) because GetSteamIdFromPlayer can resolve to
+        /// either depending on listen-server vs dedicated.
+        /// </summary>
+        public void CleanupForPlayer(ulong steamId, ulong clientId)
+        {
+            CleanupKey(steamId);
+            if (clientId != steamId) CleanupKey(clientId);
+
+            // Also static dicts.
+            LastTouchedPuck.Remove(steamId);
+            PlayerPassSettings.Remove(steamId);
+            PlayerTapPassSettings.Remove(steamId);
+            TapSpawnPlayers.Remove(steamId);
+            TapYoyoPlayers.Remove(steamId);
+            TapBackpassPlayers.Remove(steamId);
+            if (clientId != steamId)
+            {
+                LastTouchedPuck.Remove(clientId);
+                PlayerPassSettings.Remove(clientId);
+                PlayerTapPassSettings.Remove(clientId);
+                TapSpawnPlayers.Remove(clientId);
+                TapYoyoPlayers.Remove(clientId);
+                TapBackpassPlayers.Remove(clientId);
+            }
+        }
+
+        private void CleanupKey(ulong key)
+        {
+            if (playerYoyoPucks.TryGetValue(key, out Puck puck) && puck != null)
+                puckReturning.Remove(puck);
+            playerYoyoPucks.Remove(key);
+            puckTouchTime.Remove(key);
+            playerStickTrackers.Remove(key);
+            playerStickTapTrackers.Remove(key);
+            lastYankTime.Remove(key);
         }
         
         // Track last touched puck per player (for /pop command) - works for ALL players, not just yoyo

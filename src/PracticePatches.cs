@@ -257,69 +257,56 @@ public static class FakePlayerDetector
 // The physics adjustments (drag) only apply to AI GOALIES, not traffic.
 // ============================================================================
 
-/*  DISABLED for B310: These patch classes reference PlayerBodyV2 which doesn't exist.
-    They are kept for B202 compatibility but will not compile on B310.
-    Dynamic patching in MaxPracticePlugin.cs handles B310 versions.
-
 /// <summary>
-/// Catch exceptions from CompetitivePuckTweaks' PlayerBodyPatch (OnNetworkPostSpawn) for fake players.
-/// CompTweaks accesses Player.IsReplay.Value which throws null for fake players.
-/// We use a finalizer to let the original run but catch CompTweaks exceptions.
-/// NOTE: PlayerBodyV2 doesn't exist in B310 (renamed to PlayerBody).
-/// This patch is applied dynamically in MaxPracticePlugin.cs OnEnable() instead of via compile-time attribute.
+/// Catch exceptions from CompetitivePuckTweaks' PlayerBodyPatch (postfix on
+/// PlayerBody.OnNetworkPostSpawn). CompTweaks 0.6b-b3 added an unguarded
+/// `__instance.Player.PlayerPosition.Name == "C"` access for the CenterSpawnOffset
+/// fix. Our AI goalies / traffic dummies are spawned without claiming a
+/// PlayerPosition slot, so PlayerPosition is null and CompTweaks throws NRE —
+/// which breaks the network spawn flow for the fake player. Finalizer swallows
+/// the exception only for fake players, leaving real players untouched. Also
+/// applies AI-goalie drag (CompTweaks zeros it out elsewhere).
 /// </summary>
-// [HarmonyPatch(typeof(PlayerBodyV2), "OnNetworkPostSpawn")]  // DISABLED: Dynamic patching in MaxPracticePlugin
-public static class SkipCompTweaks_PlayerBodySpawnPatch
+[HarmonyPatch(typeof(PlayerBody), "OnNetworkPostSpawn")]
+public static class SkipCompTweaks_PlayerBodyOnNetworkPostSpawnPatch
 {
     [HarmonyFinalizer]
-    public static Exception Finalizer(object __instance, Exception __exception)
+    public static Exception Finalizer(PlayerBody __instance, Exception __exception)
     {
-        // If there was an exception and this is ANY fake player (goalie or traffic), suppress it
-        if (__exception != null)
-        {
-            try
-            {
-                if (FakePlayerDetector.IsAnyFakePlayerBody(__instance))
-                {
-                    // Apply physics settings only for AI goalie, not traffic
-                    if (FakePlayerDetector.IsFakePlayerBody(__instance))
-                    {
-                        ApplyAIGoaliePhysics(__instance);
-                    }
-                    return null; // Suppress the exception for all fake players
-                }
-            }
-            catch { }
-        }
-        return __exception;
-    }
-    
-    [HarmonyPostfix]
-    [HarmonyPriority(Priority.Last)]
-    public static void Postfix(object __instance)
-    {
-        // Apply physics as a postfix only for AI goalie (not traffic)
+        if (__exception == null) return null;
         try
         {
-            if (FakePlayerDetector.IsFakePlayerBody(__instance))
+            if (FakePlayerDetector.IsAnyFakePlayerBody(__instance))
             {
-                ApplyAIGoaliePhysics(__instance);
+                if (FakePlayerDetector.IsFakePlayerBody(__instance))
+                    ApplyAIGoaliePhysics(__instance);
+                return null;
             }
         }
         catch { }
+        return __exception;
     }
-    
-    private static void ApplyAIGoaliePhysics(object body)
+
+    [HarmonyPostfix]
+    [HarmonyPriority(Priority.Last)]
+    public static void Postfix(PlayerBody __instance)
     {
-        // Only apply physics changes if CompetitivePuckTweaks is loaded
+        try
+        {
+            if (FakePlayerDetector.IsFakePlayerBody(__instance))
+                ApplyAIGoaliePhysics(__instance);
+        }
+        catch { }
+    }
+
+    private static void ApplyAIGoaliePhysics(PlayerBody body)
+    {
         if (!CompTweaksDetector.IsCompTweaksLoaded) return;
-        
         try
         {
             var rb = body.GetComponent<Rigidbody>();
             if (rb != null)
             {
-                // High damping to counteract CompetitivePuckTweaks' zero drag settings
                 rb.linearDamping = 4.0f;
                 rb.angularDamping = 1.0f;
             }
@@ -327,7 +314,29 @@ public static class SkipCompTweaks_PlayerBodySpawnPatch
         catch { }
     }
 }
-*/
+
+/// <summary>
+/// Catch exceptions from CompetitivePuckTweaks' PlayerSpawnPatch (postfix on
+/// Player.Server_SpawnCharacter). Same root cause as the PlayerBody finalizer
+/// above — CompTweaks' CenterSpawnOffset path dereferences PlayerPosition.Name
+/// without a null check, and our fake players don't claim a position.
+/// </summary>
+[HarmonyPatch(typeof(Player), nameof(Player.Server_SpawnCharacter))]
+public static class SkipCompTweaks_PlayerServerSpawnCharacterPatch
+{
+    [HarmonyFinalizer]
+    public static Exception Finalizer(Player __instance, Exception __exception)
+    {
+        if (__exception == null) return null;
+        try
+        {
+            if (__instance != null && FakePlayerDetector.IsAnyFakePlayer(__instance))
+                return null;
+        }
+        catch { }
+        return __exception;
+    }
+}
 
 /// <summary>
 /// Skip CompetitivePuckTweaks' MovementPatch (Start) for fake players.
@@ -413,53 +422,43 @@ public static class SkipCompTweaks_MovementFixedUpdatePatch
     }
 }
 
-/*  DISABLED for B310: Patch classes that reference PlayerBodyV2
 /// <summary>
-/// Catch exceptions from CompetitivePuckTweaks' PlayerBodyFixedUpdatePatch for fake players.
-/// CompTweaks accesses IsUpright and IsSideways which may throw for fake players.
-/// NOTE: PlayerBodyV2 doesn't exist in B310. Dynamic patching in MaxPracticePlugin.cs handles this.
+/// Catch NRE from CompetitivePuckTweaks' PlayerBodyFixedUpdatePatch on fake players.
+/// CompTweaks dereferences IsUpright/IsSideways and Player.Role inside its Postfix —
+/// both can be null/uninitialized on our AI goalies and traffic dummies. Also
+/// re-applies AI-goalie drag here so CompTweaks' zero-drag config can't override it.
 /// </summary>
-// [HarmonyPatch(typeof(PlayerBodyV2), "FixedUpdate")]  // DISABLED: Dynamic patching in MaxPracticePlugin
+[HarmonyPatch(typeof(PlayerBody), "FixedUpdate")]
 public static class SkipCompTweaks_PlayerBodyFixedUpdatePatch
 {
     [HarmonyFinalizer]
-    public static Exception Finalizer(object __instance, Exception __exception)
+    public static Exception Finalizer(PlayerBody __instance, Exception __exception)
     {
-        // If there was an exception and this is ANY fake player (goalie or traffic), suppress it
-        if (__exception != null)
+        if (__exception == null) return null;
+        try
         {
-            try
-            {
-                if (FakePlayerDetector.IsAnyFakePlayerBody(__instance))
-                {
-                    return null; // Suppress the exception for fake players
-                }
-            }
-            catch { }
+            if (FakePlayerDetector.IsAnyFakePlayerBody(__instance))
+                return null;
         }
-        return __exception; // Let other exceptions through
+        catch { }
+        return __exception;
     }
-    
+
     [HarmonyPostfix]
     [HarmonyPriority(Priority.Last)]
-    public static void Postfix(object __instance)
+    public static void Postfix(PlayerBody __instance)
     {
-        // Reset physics for AI GOALIE only (not traffic) after everything runs
         try
         {
             if (!NetworkManager.Singleton.IsServer) return;
             if (__instance == null) return;
-            
-            // Only apply drag to AI goalie, NOT traffic dummies
-            if (FakePlayerDetector.IsFakePlayerBody(__instance))
+            if (!FakePlayerDetector.IsFakePlayerBody(__instance)) return;
+
+            var rb = __instance.GetComponent<Rigidbody>();
+            if (rb != null)
             {
-                var rb = __instance.GetComponent<Rigidbody>();
-                if (rb != null)
-                {
-                    // High damping to counteract CompetitivePuckTweaks' zero drag - reset every frame
-                    rb.linearDamping = 4.0f;
-                    rb.angularDamping = 1.0f;
-                }
+                rb.linearDamping = 4.0f;
+                rb.angularDamping = 1.0f;
             }
         }
         catch { }
@@ -467,55 +466,202 @@ public static class SkipCompTweaks_PlayerBodyFixedUpdatePatch
 }
 
 /// <summary>
-/// Catch exceptions from CompetitivePuckTweaks' PlayerBodyDashLeftPatch for fake players.
-/// NOTE: PlayerBodyV2 doesn't exist in B310. Dynamic patching in MaxPracticePlugin.cs handles this.
+/// Catch NRE from CompetitivePuckTweaks' PlayerBodyDashLeftPatch on fake players
+/// (CompTweaks dereferences Player.IsReplay.Value in the prefix).
 /// </summary>
-// [HarmonyPatch(typeof(PlayerBodyV2), "DashLeft")]  // DISABLED: Dynamic patching in MaxPracticePlugin
+[HarmonyPatch(typeof(PlayerBody), "DashLeft")]
 public static class SkipCompTweaks_DashLeftPatch
 {
     [HarmonyFinalizer]
-    public static Exception Finalizer(object __instance, Exception __exception)
+    public static Exception Finalizer(PlayerBody __instance, Exception __exception)
     {
-        if (__exception != null)
+        if (__exception == null) return null;
+        try
         {
-            try
-            {
-                if (FakePlayerDetector.IsAnyFakePlayerBody(__instance))
-                {
-                    return null; // Suppress the exception for fake players
-                }
-            }
-            catch { }
+            if (FakePlayerDetector.IsAnyFakePlayerBody(__instance))
+                return null;
         }
+        catch { }
         return __exception;
     }
 }
 
 /// <summary>
-/// Catch exceptions from CompetitivePuckTweaks' PlayerBodyDashRightPatch for fake players.
-/// NOTE: PlayerBodyV2 doesn't exist in B310. Dynamic patching in MaxPracticePlugin.cs handles this.
+/// Catch NRE from CompetitivePuckTweaks' PlayerBodyDashRightPatch on fake players.
 /// </summary>
-// [HarmonyPatch(typeof(PlayerBodyV2), "DashRight")]  // DISABLED: Dynamic patching in MaxPracticePlugin
+[HarmonyPatch(typeof(PlayerBody), "DashRight")]
 public static class SkipCompTweaks_DashRightPatch
 {
     [HarmonyFinalizer]
-    public static Exception Finalizer(object __instance, Exception __exception)
+    public static Exception Finalizer(PlayerBody __instance, Exception __exception)
     {
-        if (__exception != null)
+        if (__exception == null) return null;
+        try
         {
-            try
-            {
-                if (FakePlayerDetector.IsAnyFakePlayerBody(__instance))
-                {
-                    return null; // Suppress the exception for fake players
-                }
-            }
-            catch { }
+            if (FakePlayerDetector.IsAnyFakePlayerBody(__instance))
+                return null;
         }
+        catch { }
         return __exception;
     }
 }
-*/
+
+/// <summary>
+/// Catch NRE from CompetitivePuckTweaks' StickPatch (Postfix on Stick.OnNetworkPostSpawn).
+/// Two failure modes:
+///   1. Direct: __instance is a fake player's stick whose StickMesh is null
+///      (CurvedStick interaction) — CompTweaks NREs reading __instance.Rigidbody.mass
+///      or iterating its colliders.
+///   2. Cross-iteration: CompTweaks iterates EVERY Stick in the scene to set up
+///      collision ignores. If any fake-player stick anywhere has a null mesh, the
+///      inner loop NREs — even though __instance is a real player. Without a
+///      fallback, the real player's character spawn breaks downstream.
+/// We suppress for both cases.
+/// </summary>
+[HarmonyPatch(typeof(Stick), "OnNetworkPostSpawn")]
+public static class SkipCompTweaks_StickOnNetworkPostSpawnPatch
+{
+    [HarmonyFinalizer]
+    public static Exception Finalizer(Stick __instance, Exception __exception)
+    {
+        if (__exception == null) return null;
+        try
+        {
+            if (__instance != null && FakePlayerDetector.IsAnyFakePlayer(__instance.Player))
+                return null;
+
+            // Cross-iteration fallback: any fake player in the scene means
+            // CompTweaks could have NRE'd reaching one of them inside its
+            // FindObjectsByType<Stick> loop. Only swallow null-deref exceptions
+            // so genuine bugs still surface.
+            if (MaxPracticePlugin.FakePlayers.Count > 0 &&
+                (__exception is NullReferenceException || __exception is System.ArgumentNullException))
+                return null;
+        }
+        catch { }
+        return __exception;
+    }
+}
+
+/// <summary>
+/// Catch NRE from CompetitivePuckTweaks' PuckPatch (Postfix on Puck.OnNetworkPostSpawn).
+/// When EnableMidStickCollider is on, CompTweaks iterates every Stick to set up
+/// IgnoreCollision with each stick's BoxCollider. A fake-player stick without
+/// the BoxCollider yet would pass null to Physics.IgnoreCollision and throw
+/// ArgumentNullException — breaking the puck's network spawn for everyone.
+/// </summary>
+[HarmonyPatch(typeof(Puck), "OnNetworkPostSpawn")]
+public static class SkipCompTweaks_PuckOnNetworkPostSpawnPatch
+{
+    [HarmonyFinalizer]
+    public static Exception Finalizer(Puck __instance, Exception __exception)
+    {
+        if (__exception == null) return null;
+        try
+        {
+            // Same cross-iteration logic as StickOnNetworkPostSpawn — any fake
+            // player in the scene means the FindObjectsByType<Stick> loop could
+            // have hit one of them.
+            if (MaxPracticePlugin.FakePlayers.Count > 0 &&
+                (__exception is NullReferenceException || __exception is System.ArgumentNullException))
+                return null;
+        }
+        catch { }
+        return __exception;
+    }
+}
+
+/// <summary>
+/// Catch NRE from CompetitivePuckTweaks' StickDespawnPatch (Prefix on Stick.OnNetworkDespawn).
+/// CompTweaks calls `componentInChildren.GetComponentsInChildren&lt;MeshCollider&gt;()` on
+/// a possibly-null StickMesh; crashes if our fake player's stick mesh was already torn down.
+/// </summary>
+[HarmonyPatch(typeof(Stick), "OnNetworkDespawn")]
+public static class SkipCompTweaks_StickOnNetworkDespawnPatch
+{
+    [HarmonyFinalizer]
+    public static Exception Finalizer(Stick __instance, Exception __exception)
+    {
+        if (__exception == null) return null;
+        try
+        {
+            if (__instance != null && FakePlayerDetector.IsAnyFakePlayer(__instance.Player))
+                return null;
+        }
+        catch { }
+        return __exception;
+    }
+}
+
+/// <summary>
+/// Catch NRE from CompetitivePuckTweaks' StickFixedUpdatePatch (Postfix on
+/// StickPositioner.FixedUpdate). Fires every frame and dereferences
+/// `__instance.Player.Role` and `__instance.Stick.Rigidbody` — both can be null
+/// briefly during spawn/despawn for fake players, so this would spam NREs.
+/// </summary>
+[HarmonyPatch(typeof(StickPositioner), "FixedUpdate")]
+public static class SkipCompTweaks_StickPositionerFixedUpdatePatch
+{
+    [HarmonyFinalizer]
+    public static Exception Finalizer(StickPositioner __instance, Exception __exception)
+    {
+        if (__exception == null) return null;
+        try
+        {
+            if (__instance != null && FakePlayerDetector.IsAnyFakePlayer(__instance.Player))
+                return null;
+        }
+        catch { }
+        return __exception;
+    }
+}
+
+/// <summary>
+/// Catch NRE from CompetitivePuckTweaks' PlayerLegPadFixedUpdate (Prefix on
+/// PlayerLegPad.FixedUpdate). Only active when ExtraLegPadTweening is enabled,
+/// but when it is, it dereferences LegPadHelper without checking the parent
+/// PlayerBody. Walk up to the body and skip for fake players.
+/// </summary>
+[HarmonyPatch(typeof(PlayerLegPad), "FixedUpdate")]
+public static class SkipCompTweaks_PlayerLegPadFixedUpdatePatch
+{
+    [HarmonyFinalizer]
+    public static Exception Finalizer(PlayerLegPad __instance, Exception __exception)
+    {
+        if (__exception == null) return null;
+        try
+        {
+            var body = __instance != null ? __instance.GetComponentInParent<PlayerBody>() : null;
+            if (FakePlayerDetector.IsAnyFakePlayerBody(body))
+                return null;
+        }
+        catch { }
+        return __exception;
+    }
+}
+
+/// <summary>
+/// Catch NRE from CompetitivePuckTweaks' PlayerLegPadTweenPatch (Prefix on
+/// PlayerLegPad.OnStateChanged). Dereferences `componentInParent.Player.Role`
+/// without a null guard; fires on every leg-pad state transition.
+/// </summary>
+[HarmonyPatch(typeof(PlayerLegPad), "OnStateChanged")]
+public static class SkipCompTweaks_PlayerLegPadOnStateChangedPatch
+{
+    [HarmonyFinalizer]
+    public static Exception Finalizer(PlayerLegPad __instance, Exception __exception)
+    {
+        if (__exception == null) return null;
+        try
+        {
+            var body = __instance != null ? __instance.GetComponentInParent<PlayerBody>() : null;
+            if (FakePlayerDetector.IsAnyFakePlayerBody(body))
+                return null;
+        }
+        catch { }
+        return __exception;
+    }
+}
 
 public static class PracticeStaminaPatch
 {
@@ -809,7 +955,7 @@ public static class FakePlayerStickCollisionPatch
         try
         {
             // Search all sticks in the scene
-            var allSticks = UnityEngine.Object.FindObjectsOfType<Stick>();
+            var allSticks = UnityEngine.Object.FindObjectsByType<Stick>(FindObjectsSortMode.None);
             foreach (var otherStick in allSticks)
             {
                 if (otherStick == null || otherStick == excludeStick)

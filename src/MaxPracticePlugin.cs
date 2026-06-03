@@ -172,8 +172,9 @@ public class MaxPracticePlugin : IPuckPlugin
             UnityEngine.Object.DontDestroyOnLoad(go);
             ConfigManager.Log("Added PracticeManager, WarmupGoalDetector, and YoyoManager components");
 
-            // Patch stamina depletion
-            var playerBodyType = AccessTools.TypeByName("PlayerBody") ?? AccessTools.TypeByName("PlayerBodyV2");
+            // Patch stamina depletion. PlayerBody resolves on b323+; the legacy
+            // PlayerBodyV2 fallback was kept around for B202 and is dead code now.
+            var playerBodyType = AccessTools.TypeByName("PlayerBody");
             var staminaMethod = playerBodyType != null ? AccessTools.DeclaredMethod(playerBodyType, "FixedUpdate") : null;
             if (staminaMethod != null)
             {
@@ -352,6 +353,25 @@ public class MaxPracticePlugin : IPuckPlugin
                 }
             }
             catch (Exception) { }
+        }
+    }
+
+    /// <summary>
+    /// Wipe all per-player state owned by this class. Called on disconnect.
+    /// Tries both keys (steamId and clientId) because GetSteamIdFromPlayer
+    /// resolves to OwnerClientId in most cases but to SteamId on the listen-server
+    /// host — entries could have been written under either key over a session.
+    /// </summary>
+    public static void CleanupPlayerState(ulong steamId, ulong clientId)
+    {
+        YoyoPlayers.Remove(steamId);
+        InfiniteStaminaPlayers.Remove(steamId);
+        LastPuckSpawnTime.Remove(steamId);
+        if (clientId != steamId)
+        {
+            YoyoPlayers.Remove(clientId);
+            InfiniteStaminaPlayers.Remove(clientId);
+            LastPuckSpawnTime.Remove(clientId);
         }
     }
 
