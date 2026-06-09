@@ -606,9 +606,12 @@ namespace MaxPractice
         }
 
         /// <summary>
-        /// Filter AI goalies from PlayerManager.GetPlayers() (vote counts, pause logic, etc).
-        /// PracticePatches.VoteManager_Server_AddVote_Patch already handles vote-needed
-        /// counts via the FakePlayers HashSet, so this is mostly belt-and-suspenders.
+        /// Strip every kind of MaxPractice fake player (AI goalies, traffic dummies,
+        /// passer AIs) from PlayerManager.GetPlayers(). The tab scoreboard, vote
+        /// thresholds, pause logic, etc. all read this; if a traffic dummy slips
+        /// through it shows up on the scoreboard as a real connected player.
+        /// bypassFilter is set by the replay recorder patches so AI goalies are
+        /// captured in replays.
         /// </summary>
         [HarmonyPatch(typeof(PlayerManager), nameof(PlayerManager.GetPlayers))]
         public static class ExcludeFromPlayerListPatch
@@ -617,8 +620,13 @@ namespace MaxPractice
             public static void Postfix(ref List<Player> __result)
             {
                 if (bypassFilter) return;
-                if (RedAIGoalie == null && BlueAIGoalie == null) return;
-                __result = __result.Where(p => !IsAIGoalie(p)).ToList();
+                if (MaxPracticePlugin.FakePlayers.Count == 0) return;
+                // Use the HashSet directly (reference equality) rather than the
+                // broader clientId/username detector — `FakePlayers` is populated
+                // AFTER the spawn-time GetPlayerByClientId lookup that AI spawn
+                // flows depend on, so brand-new fakes correctly slip through that
+                // single lookup, then get filtered from every subsequent call.
+                __result = __result.Where(p => !MaxPracticePlugin.FakePlayers.Contains(p)).ToList();
             }
         }
 
@@ -629,14 +637,29 @@ namespace MaxPractice
             public static void Postfix(ref List<Player> __result)
             {
                 if (bypassFilter) return;
-                if (RedAIGoalie == null && BlueAIGoalie == null) return;
-                __result = __result.Where(p => !IsAIGoalie(p)).ToList();
+                if (MaxPracticePlugin.FakePlayers.Count == 0) return;
+                // Use the HashSet directly (reference equality) rather than the
+                // broader clientId/username detector — `FakePlayers` is populated
+                // AFTER the spawn-time GetPlayerByClientId lookup that AI spawn
+                // flows depend on, so brand-new fakes correctly slip through that
+                // single lookup, then get filtered from every subsequent call.
+                __result = __result.Where(p => !MaxPracticePlugin.FakePlayers.Contains(p)).ToList();
             }
         }
 
         /// <summary>
-        /// Fix TCP preview response player count by subtracting AI goalies. Uses Newtonsoft.Json
-        /// (already a project reference) rather than System.Text.Json which isn't shipped.
+        /// Fix the TCP server-browser preview response: the game serializes
+        /// `NetworkManager.Singleton.ConnectedClientsList.Count` for `players`, but
+        /// that list still contains our fake-client-id entries for any AI goalie /
+        /// traffic dummy / passer AI in the scene — including ones whose objects
+        /// have been despawned (NetworkObject.Despawn doesn't drop the entry
+        /// because there's no transport connection to close).
+        ///
+        /// We subtract the count of fake-client-id entries directly from the live
+        /// ConnectedClientsList, so the published count matches what real players
+        /// see on the scoreboard (which uses PlayerManager.GetPlayers() — already
+        /// filtered by our patches). Uses Newtonsoft.Json (a project reference);
+        /// System.Text.Json isn't shipped.
         /// </summary>
         [HarmonyPatch(typeof(TCPServer), nameof(TCPServer.SendMessageAsync))]
         public static class FixTcpPlayerCountPatch
@@ -645,15 +668,27 @@ namespace MaxPractice
             public static void Prefix(ref string message)
             {
                 if (message == null) return;
-                if (RedAIGoalie == null && BlueAIGoalie == null) return;
-                if (!message.Contains("\"players\"")) return;
+                // Match BOTH preview-response fields, not just "players" — the
+                // string "players" alone could appear in other messages and
+                // get corrupted by the deserialize/serialize round-trip.
+                if (!message.Contains("\"players\"") || !message.Contains("\"maxPlayers\"")) return;
 
                 try
                 {
+                    var nm = NetworkManager.Singleton;
+                    if (nm == null || nm.ConnectedClientsList == null) return;
+
+                    int fakeCount = 0;
+                    foreach (var client in nm.ConnectedClientsList)
+                    {
+                        if (FakePlayerDetector.IsAnyFakeClientId(client.ClientId))
+                            fakeCount++;
+                    }
+                    if (fakeCount == 0) return;
+
                     var response = Newtonsoft.Json.JsonConvert.DeserializeObject<TCPServerPreviewResponse>(message);
                     if (response == null) return;
-                    int botCount = (RedAIGoalie != null ? 1 : 0) + (BlueAIGoalie != null ? 1 : 0);
-                    response.players = Math.Max(0, response.players - botCount);
+                    response.players = Math.Max(0, response.players - fakeCount);
                     message = Newtonsoft.Json.JsonConvert.SerializeObject(response);
                 }
                 catch { }
@@ -754,21 +789,26 @@ namespace MaxPractice
                 {
                     var cfg = __instance.ServerManager.ServerConfig;
                     int realCount = NetworkManager.Singleton.ConnectedClientsList.Count(c =>
-                        c.ClientId != connectionApproval.ClientID && !IsAIGoalieClientId(c.ClientId));
+                        c.ClientId != connectionApproval.ClientID && !FakePlayerDetector.IsAnyFakeClientId(c.ClientId));
                     if (realCount < cfg.maxPlayers) __result = null; // approve
                 }
                 catch { }
             }
         }
 
+        /// <summary>
+        /// Strip every fake player (goalies + traffic + passers) from the puck's
+        /// last-touched list. Otherwise a traffic dummy bumping a puck would steal
+        /// the "last touch" credit and break goal/assist attribution.
+        /// </summary>
         [HarmonyPatch(typeof(Puck), nameof(Puck.GetPlayerCollisions))]
         public static class FilterAIGoalieFromCollisionsPatch
         {
             [HarmonyPostfix]
             public static void Postfix(ref List<KeyValuePair<Player, float>> __result)
             {
-                if (RedAIGoalie == null && BlueAIGoalie == null) return;
-                __result = __result.Where(kvp => !IsAIGoalie(kvp.Key)).ToList();
+                if (MaxPracticePlugin.FakePlayers.Count == 0) return;
+                __result = __result.Where(kvp => !MaxPracticePlugin.FakePlayers.Contains(kvp.Key)).ToList();
             }
         }
 
@@ -778,8 +818,8 @@ namespace MaxPractice
             [HarmonyPostfix]
             public static void Postfix(ref List<KeyValuePair<Player, float>> __result)
             {
-                if (RedAIGoalie == null && BlueAIGoalie == null) return;
-                __result = __result.Where(kvp => !IsAIGoalie(kvp.Key)).ToList();
+                if (MaxPracticePlugin.FakePlayers.Count == 0) return;
+                __result = __result.Where(kvp => !MaxPracticePlugin.FakePlayers.Contains(kvp.Key)).ToList();
             }
         }
     }
@@ -879,7 +919,10 @@ namespace MaxPractice
             int n = 0;
             foreach (var c in nm.ConnectedClientsList)
             {
-                if (GoalieAIManager.IsAIGoalieClientId(c.ClientId)) continue;
+                // ID-based first — catches stale entries whose PlayerObject is
+                // already despawned. Player-based check is the fallback for any
+                // fake player whose ID falls outside our reserved ranges.
+                if (FakePlayerDetector.IsAnyFakeClientId(c.ClientId)) continue;
                 if (FakePlayerDetector.IsAnyFakePlayer(c.PlayerObject?.GetComponent<Player>())) continue;
                 n++;
             }
