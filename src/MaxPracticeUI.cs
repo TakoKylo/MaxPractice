@@ -369,12 +369,13 @@ namespace MaxPractice
                 bigTitle.style.unityFontStyleAndWeight = FontStyle.Normal;
                 bigTitle.style.fontSize = 50;
                 bigTitle.style.color = Color.white;
-                bigTitle.style.marginBottom = 8;
+                bigTitle.style.marginBottom = 16;
                 _panel.Add(bigTitle);
 
                 var tabBar = new UITK.VisualElement();
                 tabBar.style.flexDirection = UITK.FlexDirection.Row;
                 tabBar.style.marginBottom = 8;
+                tabBar.style.height = 50;
                 _panel.Add(tabBar);
                 ForceUIFont(_panel);
 
@@ -385,6 +386,9 @@ namespace MaxPractice
                 AddTabHover(_tabCommands, () => _activeTab == UiTab.Commands);
                 AddTabHover(_tabHelp, () => _activeTab == UiTab.Help);
                 _tabServer = MakeTab("SERVER", () => ShowTab(UiTab.Server));
+                // Last tab keeps no right margin so SERVER sits flush with the
+                // right edge the same way COMMANDS hugs the left.
+                _tabServer.style.marginRight = 0;
                 tabBar.Add(_tabServer);
                 AddTabHover(_tabServer, () => _activeTab == UiTab.Server);
 
@@ -394,6 +398,12 @@ namespace MaxPractice
                     horizontalScrollerVisibility = UITK.ScrollerVisibility.Hidden
                 };
                 scroll.style.flexGrow = 1;
+                // A flex item's default min-height is its content size, so a
+                // long list would keep the scroll view tall and push the footer
+                // past the panel's clipped bottom; pin min-height to 0 so the
+                // list shrinks and the footer stays in.
+                scroll.style.flexShrink = 1;
+                scroll.style.minHeight = 0;
                 _panel.Add(scroll);
 
                 _commandsSectionVE = new UITK.VisualElement();
@@ -405,16 +415,12 @@ namespace MaxPractice
                 BuildCommandsSection();
                 BuildHelpSection();
                 BuildServerSection();
-                scroll.Add(_commandsSectionVE);
-                scroll.Add(_helpSectionVE);
-
-                BuildCommandsSection();
-                BuildHelpSection();
 
                 var footer = new UITK.VisualElement();
                 footer.style.flexDirection = UITK.FlexDirection.Row;
                 footer.style.justifyContent = UITK.Justify.SpaceBetween;
                 footer.style.marginTop = 8;
+                footer.style.flexShrink = 0;   // footer keeps its size; the list shrinks instead
 
                 var coffee = MakeFooterButton("COFFEE?", () => Application.OpenURL("https://buymeacoffee.com/amikiir"));
                 var rightButtons = new UITK.VisualElement();
@@ -434,6 +440,7 @@ namespace MaxPractice
                     HideUI();
                 });
                 close.style.marginLeft = 8;
+                close.style.paddingRight = 182;
 
                 rightButtons.Add(reset);
                 rightButtons.Add(close);
@@ -505,7 +512,9 @@ namespace MaxPractice
             b.style.paddingLeft = 8;
             b.style.paddingRight = 8;
             b.style.marginRight = 8;
-            b.style.marginBottom = 26;
+            // Spacing below the tab strip is owned by tabBar.marginBottom; the
+            // button keeps no bottom margin of its own.
+            b.style.marginBottom = 0;
             b.style.fontSize = 24;
             b.style.borderTopLeftRadius = 6;
             b.style.borderTopRightRadius = 6;
@@ -519,12 +528,13 @@ namespace MaxPractice
             return b;
         }
 
+        // PlayerQoL footer buttons: no bottom margins of their own - the 8px
+        // gap under the row comes from the panel's bottom padding.
         private UITK.Button MakeFooterButton(string text, Action onClick)
         {
             var b = new UITK.Button(onClick) { text = text.ToUpperInvariant() };
             b.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
             b.style.height = 50;
-            b.style.marginBottom = 16;
             b.style.paddingLeft = 18;
             b.style.paddingRight = 18;
             b.style.backgroundColor = BtnBrightGray;
@@ -586,7 +596,7 @@ namespace MaxPractice
             row.style.flexDirection = UITK.FlexDirection.Row;
             row.style.alignItems = UITK.Align.Center;
             row.style.height = 50;
-            row.style.marginBottom = 10;
+            row.style.marginBottom = 8;
             row.style.backgroundColor = new UITK.StyleColor(RowBg);
             row.style.paddingLeft = 12;
             row.style.paddingRight = 10;
@@ -745,7 +755,7 @@ namespace MaxPractice
             var row = new UITK.VisualElement();
             row.style.flexDirection = UITK.FlexDirection.Column;
             row.style.height = 50;
-            row.style.marginBottom = 10;
+            row.style.marginBottom = 8;
             row.style.backgroundColor = new UITK.StyleColor(RowBg);
             row.style.paddingLeft = 12;
             row.style.paddingRight = 10;
@@ -801,10 +811,8 @@ namespace MaxPractice
         {
             if (_isCapturing) CancelCapture();
 
+            // No default binds - reset just clears every row.
             MaxPracticeKeybindManager.Config.commandBinds.Clear();
-            MaxPracticeKeybindManager.Config.commandBinds.Add("/s:G");
-            MaxPracticeKeybindManager.Config.commandBinds.Add("/backpass:H");
-            MaxPracticeKeybindManager.Config.commandBinds.Add("/pop:V");
             MaxPracticeKeybindManager.SaveConfig();
         }
 

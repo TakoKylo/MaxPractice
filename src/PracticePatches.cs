@@ -121,6 +121,20 @@ public static class FakePlayerDetector
         catch { return false; }
     }
     
+    /// <summary>
+    /// True if `clientId` falls in any range MaxPractice uses for fake players
+    /// (AI goalies, traffic dummies, passer AIs). Works on stale ConnectedClientsList
+    /// entries whose Player/PlayerObject have already been despawned, since it
+    /// only inspects the ID.
+    /// </summary>
+    public static bool IsAnyFakeClientId(ulong clientId)
+    {
+        return clientId == FAKE_RED_CLIENT_ID
+            || clientId == FAKE_BLUE_CLIENT_ID
+            || (clientId >= TRAFFIC_CLIENT_ID_START && clientId < TRAFFIC_CLIENT_ID_END)
+            || (clientId >= PASSER_CLIENT_ID_START && clientId < PASSER_CLIENT_ID_END);
+    }
+
     public static bool IsFakePlayer(Player player)
     {
         if (player == null) return false;
