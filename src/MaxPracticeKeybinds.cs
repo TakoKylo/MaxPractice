@@ -77,11 +77,8 @@ namespace MaxPractice
 
                 if (!File.Exists(BindsPath))
                 {
+                    // No default binds - players add their own rows in the UI.
                     var c = new MaxPracticeKeybindConfig();
-                    // Default binds
-                    c.commandBinds.Add("/s:G");
-                    c.commandBinds.Add("/backpass:H");
-                    c.commandBinds.Add("/pop:V");
                     AtomicWrite(BindsPath, JsonUtility.ToJson(c, true));
                     Debug.Log("[MaxPractice] Created default keybind config: " + BindsPath);
                 }
