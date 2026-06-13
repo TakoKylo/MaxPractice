@@ -85,13 +85,19 @@ public static class FakePlayerDetector
     public const ulong FAKE_RED_CLIENT_ID = 1111112;
     public const ulong FAKE_BLUE_CLIENT_ID = 1111111;
     
-    // Client ID range for traffic dummies (3333333 to 3333499)
+    // Client ID range for traffic dummies. SkaterAI builds IDs as
+    //   3333333 + uniqueTrafficNum + (isRedTeam ? 0 : 1000)
+    // — so the blue-team offset alone pushes IDs to 3334333+. End needs to
+    // sit well above 3334333 + max-spawns-per-session. Original 3333500 cap
+    // dropped every blue traffic entry on the floor; widened to a 100k slot
+    // so we can't outgrow it in any realistic session.
     public const ulong TRAFFIC_CLIENT_ID_START = 3333333;
-    public const ulong TRAFFIC_CLIENT_ID_END = 3333500;
-    
-    // Client ID range for passer AIs (4444444 to 4444599)
-    public const ulong PASSER_CLIENT_ID_START = 4444444;
-    public const ulong PASSER_CLIENT_ID_END = 4444600;
+    public const ulong TRAFFIC_CLIENT_ID_END   = 3433333;
+
+    // Client ID range for passer AIs. Same +1000 blue-team offset pattern
+    // as traffic; same fix.
+    public const ulong PASSER_CLIENT_ID_START  = 4444444;
+    public const ulong PASSER_CLIENT_ID_END    = 4544444;
     
     /// <summary>
     /// PUBLIC API: Check if a player is ANY type of MaxPractice fake player.
