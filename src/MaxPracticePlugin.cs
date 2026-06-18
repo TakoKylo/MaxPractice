@@ -357,6 +357,92 @@ public class MaxPracticePlugin : IPuckPlugin
     }
 
     /// <summary>
+    /// Remove a fake-client entry from NetworkManager's internal connection state.
+    /// NetworkObject.Despawn doesn't touch the NetworkClient record because there
+    /// is no transport socket to close for our manufactured clients, so without
+    /// this the entries linger until server restart and inflate
+    /// ConnectedClientsList.Count — which the TCP server-browser preview,
+    /// ConnectionApprovalManager.GetConnectionRejectionCode, and a few other game
+    /// systems read directly. (Reported by oomtm450 on Puck Discord: a server
+    /// would show "14/14" in the browser when only 13 humans were present, then
+    /// let clients in without mod sync because the browser said the server was
+    /// full.)
+    ///
+    /// We touch the internal collections through reflection rather than calling
+    /// NetworkManager.DisconnectClient because the latter sends a
+    /// ClientDisconnectedMessage to every real client (which they would try to
+    /// process for a player they never knew about) and triggers
+    /// OnClientDisconnectCallback (which would re-enter our traffic cleanup for
+    /// the "disconnected" client).
+    /// </summary>
+    public static void RemoveFakeClientFromNetworkManager(ulong clientId)
+    {
+        if (!FakePlayerDetector.IsAnyFakeClientId(clientId)) return;
+
+        var nm = NetworkManager.Singleton;
+        if (nm == null || !nm.IsServer) return;
+
+        try
+        {
+            var connMgrField = typeof(NetworkManager).GetField("ConnectionManager",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (connMgrField == null) return;
+
+            object connMgr = connMgrField.GetValue(nm);
+            if (connMgr == null) return;
+
+            Type connMgrType = connMgr.GetType();
+
+            bool removedAny = false;
+
+            // Snapshot the NetworkClient first so we can also remove it from the
+            // parallel ConnectedClientsList (which holds the same instance).
+            object entry = null;
+            var ccField = connMgrType.GetField("ConnectedClients",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (ccField?.GetValue(connMgr) is System.Collections.IDictionary cc && cc.Contains(clientId))
+            {
+                entry = cc[clientId];
+                cc.Remove(clientId);
+                removedAny = true;
+            }
+
+            var ccListField = connMgrType.GetField("ConnectedClientsList",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (ccListField?.GetValue(connMgr) is System.Collections.IList ccList && entry != null)
+            {
+                ccList.Remove(entry);
+            }
+
+            // ConnectedClientIds is List<ulong> (not HashSet<ulong> — confirmed
+            // against the b897 Unity.Netcode.Runtime decompile). Use the IList
+            // surface for the remove so the boxed ulong matches via Equals.
+            var ccIdsField = connMgrType.GetField("ConnectedClientIds",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (ccIdsField?.GetValue(connMgr) is System.Collections.IList ccIds)
+            {
+                int idx = -1;
+                for (int i = 0; i < ccIds.Count; i++)
+                {
+                    if (ccIds[i] is ulong id && id == clientId) { idx = i; break; }
+                }
+                if (idx >= 0)
+                {
+                    ccIds.RemoveAt(idx);
+                    removedAny = true;
+                }
+            }
+
+            if (removedAny)
+                ConfigManager.Dbg($"[MaxPractice] Removed fake client {clientId} from NetworkManager state");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[MaxPractice] Failed to remove fake client {clientId} from NetworkManager: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// Wipe all per-player state owned by this class. Called on disconnect.
     /// Tries both keys (steamId and clientId) because GetSteamIdFromPlayer
     /// resolves to OwnerClientId in most cases but to SteamId on the listen-server

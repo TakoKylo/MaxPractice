@@ -359,6 +359,32 @@ public static class SkipCompTweaks_PlayerServerSpawnCharacterPatch
 }
 
 /// <summary>
+/// When any fake-client Player despawns, also drop its NetworkClient record
+/// from NetworkManager. NetworkObject.Despawn doesn't trigger the normal
+/// OnClientDisconnectFromServer flow for our manufactured clients (they have
+/// no transport socket to close), so without this the entries linger in
+/// ConnectedClientsList until the server restarts — which inflates
+/// ConnectedClientsList.Count for the TCP server-browser preview and
+/// ConnectionApprovalManager.GetConnectionRejectionCode.
+/// Covers every despawn path (CleanupDummies, DespawnAIGoalie, /removedummy,
+/// SkaterAI traffic cleanup, etc.) from one central postfix.
+/// </summary>
+[HarmonyPatch(typeof(Player), nameof(Player.OnNetworkDespawn))]
+public static class FakeClientNetworkManagerCleanupPatch
+{
+    [HarmonyPostfix]
+    public static void Postfix(Player __instance)
+    {
+        try
+        {
+            if (__instance == null) return;
+            MaxPracticePlugin.RemoveFakeClientFromNetworkManager(__instance.OwnerClientId);
+        }
+        catch { }
+    }
+}
+
+/// <summary>
 /// Skip CompetitivePuckTweaks' MovementPatch (Start) for fake players.
 /// CompTweaks accesses Player.IsReplay.Value which throws null for fake players.
 /// </summary>
