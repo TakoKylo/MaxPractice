@@ -298,7 +298,7 @@ namespace MaxPractice
 
                 try
                 {
-                    if (body.HasFallen || body.HasSlipped)
+                    if (body.HasFallen.Value || body.HasSlipped)
                     {
                         fallenTimer += updateInterval;
                         if (fallenTimer >= FALLEN_RESPAWN_DELAY)
@@ -319,7 +319,7 @@ namespace MaxPractice
                             }
 
                             body.KeepUpright.Balance = 1f;
-                            body.HasFallen = false;
+                            body.HasFallen.Value = false;
                             body.HasSlipped = false;
 
                             ResetInputs();
@@ -1438,7 +1438,7 @@ namespace MaxPractice
                 // in case a prior sad reaction's 40% flop left Balance=0 / HasFallen=true.
                 try { body.Stamina.Value = 1f; } catch { }
                 try { if (body.KeepUpright != null) body.KeepUpright.Balance = 1f; } catch { }
-                try { body.HasFallen = false; body.HasSlipped = false; } catch { }
+                try { body.HasFallen.Value = false; body.HasSlipped = false; } catch { }
 
                 // Zero out movement — celebrating in place.
                 playerInput.MoveInput.ServerValue = Vector2.zero;
@@ -1593,7 +1593,7 @@ namespace MaxPractice
                 try
                 {
                     if (body != null && body.KeepUpright != null) body.KeepUpright.Balance = 1f;
-                    if (body != null) { body.HasFallen = false; body.HasSlipped = false; }
+                    if (body != null) { body.HasFallen.Value = false; body.HasSlipped = false; }
                 }
                 catch { }
             }
