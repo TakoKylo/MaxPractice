@@ -36,14 +36,18 @@
            reference assemblies already provided by the SDK (mscorlib,
            netstandard, System.*). The game ships its own copies but using
            them at compile time produces CS0433 duplicate-type errors. -->
+      <!-- Puck.dll is pinned to a local snapshot in libs\ (see the explicit
+           Puck reference below), so exclude the live copy here to avoid a
+           CS0433 duplicate-'Puck' reference. Refresh libs\Puck.dll on each
+           game update. -->
       <GameLibs Include="$(GameManaged)\*.dll"
-                Exclude="$(GameManaged)\System.dll;$(GameManaged)\System.*.dll;$(GameManaged)\mscorlib.dll;$(GameManaged)\netstandard.dll" />
+                Exclude="$(GameManaged)\System.dll;$(GameManaged)\System.*.dll;$(GameManaged)\mscorlib.dll;$(GameManaged)\netstandard.dll;$(GameManaged)\Puck.dll" />
       <Reference Include="@(GameLibs)">
         <HintPath>%(GameLibs.FullPath)</HintPath>
         <Private>false</Private>
       </Reference>
 
-      <ExtraLibs Include="libs\*.dll" Exclude="libs\System.*.dll" />
+      <ExtraLibs Include="libs\*.dll" Exclude="libs\System.*.dll;libs\Puck.dll" />
       <Reference Include="@(ExtraLibs)">
         <HintPath>%(ExtraLibs.FullPath)</HintPath>
         <Private>false</Private>
@@ -58,9 +62,10 @@
       <Private>false</Private>
     </Reference>
 
-    <!-- Main game assemblies -->
+    <!-- Main game assembly, pinned to a local snapshot (b1153). Refresh with:
+         cp "$(GameManaged)\Puck.dll" libs\Puck.dll -->
     <Reference Include="Puck">
-      <HintPath>$(GameManaged)\Puck.dll</HintPath>
+      <HintPath>libs\Puck.dll</HintPath>
       <Private>false</Private>
     </Reference>
 
