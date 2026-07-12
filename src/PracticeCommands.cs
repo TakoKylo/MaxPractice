@@ -108,6 +108,18 @@ public static class PracticeCommandPatch
         PracticeHelpers.SendChatMessage(ui, "<size=70%>" + msg + "</size>");
     }
 
+    // Every command that wipes pucks/traffic/dummies — the anti-grief cooldown
+    // applies to all of them from one shared bucket. Kept in sync with the
+    // clear handlers in HandlePracticeCommand. /clearpasser is excluded (it's a
+    // no-op in B310) and /emptyall (currently unhandled, so nothing to throttle).
+    private static bool IsClearCommand(string cmd)
+    {
+        return cmd == "/clearall" ||
+               cmd == "/clearpucks" || cmd == "/clear" || cmd == "/c" || cmd == "/emptypucks" ||
+               cmd == "/clearminefield" || cmd == "/clearcones" ||
+               cmd.StartsWith("/cleartraffic");
+    }
+
     private static string TeamColor(Player p)
     {
         if (p == null) return GREY;
@@ -128,6 +140,26 @@ public static class PracticeCommandPatch
             {
                 SendPrivate(ui, clientId, WHITE + "This command is only available during warmup phase." + EC);
                 return false;
+            }
+
+            // Anti-grief: rate-limit the clear family. Players were spamming
+            // /clearall & /clearpucks to repeatedly wipe everyone's pucks and
+            // flood chat. A single shared cooldown bucket per player means
+            // alternating /clearall, /clearpucks, /cleartraffic… can't sidestep it.
+            if (IsClearCommand(cmd))
+            {
+                float clearCd = cfg.ClearCommandCooldownSeconds;
+                if (clearCd > 0f)
+                {
+                    float now = Time.realtimeSinceStartup;
+                    if (MaxPracticePlugin.LastClearCommandTime.TryGetValue(senderSteam, out float lastClear)
+                        && now - lastClear < clearCd)
+                    {
+                        SendPrivate(ui, clientId, RED + $"Clear cooldown: {clearCd - (now - lastClear):F1}s remaining" + EC);
+                        return false;
+                    }
+                    MaxPracticePlugin.LastClearCommandTime[senderSteam] = now;
+                }
             }
 
             // /practice - list commands

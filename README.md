@@ -112,6 +112,10 @@ A config file is auto-generated at `<puck-install>/config/maxpractice.json` on f
   "PauseWarmupTimer": false,           // freeze warmup countdown
   "DisableVoting": false,              // block /vs and /vw (and /vg)
 
+  // Anti-grief
+  "ClearCommandCooldownSeconds": 30,   // per-player cooldown shared across all
+                                       // /clear* commands (0 disables)
+
   // Feature toggles (all default true)
   "EnableSpawnPuck": true,
   "EnableBackpass": true,

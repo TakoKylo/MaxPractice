@@ -41,7 +41,18 @@ namespace MaxPractice
         // When true, blocks the game-starting vote commands /vs (vote-start)
         // and /vw (vote-warmup) on the server. /vk (vote-kick) is unaffected.
         public bool DisableVoting = false;
-        
+
+        // ============================================================
+        // ANTI-GRIEF
+        // ============================================================
+        // Per-player cooldown (seconds) shared across EVERY clear command
+        // (/clearall, /clearpucks, /clear, /c, /emptypucks, /clearcones,
+        // /clearminefield, /cleartraffic…). One shared bucket per player so
+        // alternating clear commands can't sidestep the limit. Players were
+        // spamming these to repeatedly wipe everyone's pucks and flood chat.
+        // Set to 0 to disable the cooldown entirely.
+        public float ClearCommandCooldownSeconds = 30f;
+
         // ============================================================
         // COMMAND ENABLE/DISABLE
         // ============================================================

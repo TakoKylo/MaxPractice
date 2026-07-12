@@ -39,6 +39,10 @@ public class MaxPracticePlugin : IPuckPlugin
     
     // Track last handle command time per player (for cooldown)
     public static Dictionary<ulong, float> LastHandleSpawnTime = new Dictionary<ulong, float>();
+
+    // Track last clear-command time per player (anti-grief). Shared across all
+    // /clear* commands so alternating them can't bypass the cooldown.
+    public static Dictionary<ulong, float> LastClearCommandTime = new Dictionary<ulong, float>();
     
     // Track handle pucks per player (steamId -> list of pucks)
     public static Dictionary<ulong, List<Puck>> HandlePucks = new Dictionary<ulong, List<Puck>>();
@@ -453,11 +457,13 @@ public class MaxPracticePlugin : IPuckPlugin
         YoyoPlayers.Remove(steamId);
         InfiniteStaminaPlayers.Remove(steamId);
         LastPuckSpawnTime.Remove(steamId);
+        LastClearCommandTime.Remove(steamId);
         if (clientId != steamId)
         {
             YoyoPlayers.Remove(clientId);
             InfiniteStaminaPlayers.Remove(clientId);
             LastPuckSpawnTime.Remove(clientId);
+            LastClearCommandTime.Remove(clientId);
         }
     }
 
