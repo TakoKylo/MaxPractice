@@ -401,7 +401,7 @@ namespace MaxPractice
 
                 if (isIntermission)
                 {
-                    try { body.Stamina.Value = 1f; } catch { }
+                    try { if (body.Stamina.Value != 1f) body.Stamina.Value = 1f; } catch { }
                     UpdateIntermission();
                     return;
                 }
@@ -410,7 +410,12 @@ namespace MaxPractice
                 try
                 {
                     currentPos = body.transform.position;
-                    body.Stamina.Value = 1f;
+                    // Compare first: this runs every physics tick, and a NetworkVariable
+                    // setter is not a plain field write - it runs change detection and, when
+                    // it decides something changed, builds and queues a replication payload.
+                    // Stamina is pinned to a constant here, so after the first tick every
+                    // write is asking the netcode layer to re-establish that nothing moved.
+                    if (body.Stamina.Value != 1f) body.Stamina.Value = 1f;
                 }
                 catch { return; }
 
@@ -443,7 +448,7 @@ namespace MaxPractice
                             }
 
                             body.KeepUpright.Balance = 1f;
-                            body.HasFallen.Value = false;
+                            if (body.HasFallen.Value) body.HasFallen.Value = false;
                             body.HasSlipped = false;
 
                             ResetInputs();
@@ -1304,8 +1309,10 @@ namespace MaxPractice
                         if (p == controlledPlayer) continue;
                         if (p.Team == team) continue;            // skip teammates
                         if (p.PlayerBody == null) continue;
-                        float d = Vector3.Distance(p.PlayerBody.transform.position, puckPos);
-                        if (d < DangerRange) return true;
+                        // Squared threshold - see the note in SkaterAI.CheckForIncomingPuck.
+                        // This one runs per opposing player per goalie per tick.
+                        float dSqr = (p.PlayerBody.transform.position - puckPos).sqrMagnitude;
+                        if (dSqr < DangerRange * DangerRange) return true;
                     }
                     catch { continue; }
                 }
@@ -1615,7 +1622,7 @@ namespace MaxPractice
                 // Keep stamina pinned at 1 — every Jump() drains stamina, so without this the
                 // goalie runs out after 2-3 jumps and stops bouncing. Also restore upright state
                 // in case a prior sad reaction's 40% flop left Balance=0 / HasFallen=true.
-                try { body.Stamina.Value = 1f; } catch { }
+                try { if (body.Stamina.Value != 1f) body.Stamina.Value = 1f; } catch { }
                 try { if (body.KeepUpright != null) body.KeepUpright.Balance = 1f; } catch { }
                 try { body.HasFallen.Value = false; body.HasSlipped = false; } catch { }
 

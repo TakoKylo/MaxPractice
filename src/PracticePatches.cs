@@ -785,7 +785,9 @@ public static class PracticeStaminaPatch
             ulong steamId = PracticeHelpers.GetSteamIdFromPlayer(player);
             if (MaxPracticePlugin.InfiniteStaminaPlayers.Contains(steamId))
             {
-                body.Stamina.Value = 1f;
+                // Per PlayerBody per physics tick for every opted-in player, so the
+                // comparison is worth making before handing the netcode layer a write.
+                if (body.Stamina.Value != 1f) body.Stamina.Value = 1f;
             }
         }
         catch (Exception) { }

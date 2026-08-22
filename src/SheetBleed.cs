@@ -263,6 +263,14 @@ namespace MaxPractice
         {
             try
             {
+                // Unity's overloaded == , so this catches the destroyed-but-not-collected
+                // state as well as a plain null. Normally __instance is whatever Unity is
+                // ticking and cannot be dead - but this is a patch chain, and another mod's
+                // prefix running before ours is free to destroy the indicator. Reading
+                // .transform after that is a native fault, not a catchable NullReference,
+                // so the try/catch below would not save us.
+                if (__instance == null) return true;
+
                 // The player has these switched off entirely. Vanilla returns immediately
                 // and both renderers are already disabled - nothing for us to re-enable.
                 if (!__instance.IsVisible) return true;

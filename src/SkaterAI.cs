@@ -395,7 +395,9 @@ namespace MaxPractice
                 _nextUpdateTime = Time.time + _updateInterval;
                 
                 // Give infinite stamina
-                _body.Stamina.Value = 1f;
+                // Only when it has actually drained - see the note in GoalieAI. This is a
+                // per-tick NetworkVariable write of a constant.
+                if (_body.Stamina.Value != 1f) _body.Stamina.Value = 1f;
                 
                 // Follow player at medium range (includes facing target)
                 FollowPlayer();
@@ -411,6 +413,10 @@ namespace MaxPractice
             catch (Exception) { }
         }
         
+        /// <summary>Seconds between "no target" warnings from FollowPlayer, per AI.</summary>
+        private const float NoTargetWarnInterval = 5f;
+        private float _nextNoTargetWarn;
+
         void FollowPlayer()
         {
             if (_body == null || _bodyRb == null || _playerInput == null) return;
@@ -418,9 +424,16 @@ namespace MaxPractice
             var target = TargetPlayer;
             if (target?.PlayerBody == null) 
             {
-                // Debug: log why we can't follow (only occasionally to avoid spam)
-                if (Time.frameCount % 300 == 0)
+                // Throttled on the clock, not on Time.frameCount. Same trap as the goalie's
+                // alignment refresh: frameCount is the RENDER frame and does not advance
+                // between the several FixedUpdates that can run inside one, so every one of
+                // them passed the test together and logged as a group - while at a high frame
+                // rate the counter steps straight past multiples of 300 and the message never
+                // appears at all. Either way the interpolated string was being built on a
+                // per-tick path, per AI, for as long as the target stayed missing.
+                if (Time.unscaledTime >= _nextNoTargetWarn)
                 {
+                    _nextNoTargetWarn = Time.unscaledTime + NoTargetWarnInterval;
                     Debug.LogWarning($"[SkaterAI] FollowPlayer: No target - steamId={_targetPlayerSteamId}, hasRef={_targetPlayerRef != null}, target={target}");
                 }
                 return;
@@ -689,8 +702,11 @@ namespace MaxPractice
             // Don't intercept if puck is close to target player
             if (TargetPlayer?.PlayerBody != null)
             {
-                float distToPlayer = Vector3.Distance(closestPuck.transform.position, TargetPlayer.PlayerBody.transform.position);
-                if (distToPlayer < PlayerPuckProximity)
+                // Squared: this is a pure threshold test, and squaring orders identically.
+                // The root Vector3.Distance was taking is only worth paying for a value you
+                // are going to show or do arithmetic with, and this one is neither.
+                float sqrToPlayer = (closestPuck.transform.position - TargetPlayer.PlayerBody.transform.position).sqrMagnitude;
+                if (sqrToPlayer < PlayerPuckProximity * PlayerPuckProximity)
                     return false; // Puck is with player - can use slower update rate
             }
             
