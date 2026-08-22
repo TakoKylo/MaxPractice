@@ -1,4 +1,4 @@
-// GoalieAI.cs - Per-AI-goalie MonoBehaviour that drives PlayerInput each FixedUpdate.
+﻿// GoalieAI.cs - Per-AI-goalie MonoBehaviour that drives PlayerInput each FixedUpdate.
 // Adapted from ToastersRinkSuite reference for Puck B323 + MaxPractice. Behavior matches the
 // reference 1:1 (butterfly/standing decision tree, sad reaction, idle/intermission fidgets,
 // dash overshoot braking, look-RPC replication). The reference's global log filter has been
@@ -16,16 +16,27 @@ namespace MaxPractice
         public Player controlledPlayer;
         public PlayerTeam team;
 
-        // B323 has no RandomGoalSpots — use the same hardcoded positions as the legacy code.
-        private Vector3 redGoalPos = new Vector3(0f, 0f, -40.23f);
-        private Vector3 blueGoalPos = new Vector3(0f, 0f, 40.23f);
+        // B323 has no RandomGoalSpots, and the legacy code hardcoded the vanilla goal line at
+        // z = ±40.23. That is wrong on any rink CompAdjust has resized — the nets ride the
+        // scaled level root — so the goal line is measured live instead. See GoalGeometry.
 
         private PlayerBody body;
         private PlayerInput playerInput;
         private Rigidbody rb;
 
+        // The throttle can only fire on a fixed-step boundary, so an interval of 0.033
+        // actually elapses every ceil(0.033 / fixedDeltaTime) steps = 0.04 s at Unity's
+        // default 50 Hz. Timers inside the throttled block that advanced by updateInterval
+        // or by Time.fixedDeltaTime therefore ran ~21% slow (or, for the stick sweep, half
+        // speed): the 10 s end-of-game animation was cut off by a despawn timed in real
+        // seconds, the 6 s fallen respawn took 7.3 s, the 0.15 s poke sweep took 0.30 s.
+        // Anything timed in here should use ThrottleDelta.
         private float updateInterval = 0.033f; // ~30 ticks/s
         private float nextUpdateTime = 0f;
+
+        /// <summary>Real seconds since the previous throttled tick.</summary>
+        private float _throttleDelta = 0.04f;
+        private float _lastThrottleTime = -1f;
         private float aggressionRange = 20f;
         private int _physicsResetCounter = 0;
         private float butterflyDistance = 8.0f;
@@ -96,6 +107,65 @@ namespace MaxPractice
         // Tracks whether the head is currently turned back to watch a puck behind the net,
         // so we know to reset LookInput when the puck comes back out front.
         private bool isLookingAtPuckBehind = false;
+
+        // ------------------------------------------------------------------
+        // Look replication
+        //
+        // Every look pose in this file is pushed to clients with Server_LookInputRpc /
+        // Server_LookAngleInputRpc, targeted at Everyone. Nearly all of those callers sit
+        // inside a per-tick animation step and re-sent identical values on every tick: the
+        // LookInput bool is a constant `true` for the whole of an idle, a celebration, a sad
+        // routine or a look-behind-the-net, and the sad pose's ANGLE never moves either. On a
+        // server that keeps AI goalies through a game - GoalieAIPersistDuringGame, or a passed
+        // /votegoalies - that was two reliable RPCs per goalie per tick to every connected
+        // client, for the length of the game.
+        //
+        // These wrappers drop a send whose value has not changed. Angles that genuinely
+        // animate still go out every tick; nothing about the poses themselves changes.
+        //
+        // The cache is dropped whenever the client count rises, because RpcTarget.Everyone
+        // only reaches whoever is connected at the time. Without that, a player joining
+        // mid-game would never be told the goalie's current look state and would see its head
+        // aimed straight ahead until the pose happened to change. Same reasoning, and the same
+        // shape, as the join-triggered re-announce in PropNetwork.Tick.
+        // ------------------------------------------------------------------
+        private bool _lookInputSentValid;
+        private bool _lookInputSent;
+        private bool _lookAngleSentValid;
+        private short _lookAngleSentX;
+        private short _lookAngleSentY;
+        private int _lookLastClientCount = -1;
+
+        private void RefreshLookCacheForJoins()
+        {
+            var nm = NetworkManager.Singleton;
+            int count = (nm != null && nm.ConnectedClientsIds != null) ? nm.ConnectedClientsIds.Count : 0;
+            if (count > _lookLastClientCount)
+            {
+                _lookInputSentValid = false;
+                _lookAngleSentValid = false;
+            }
+            _lookLastClientCount = count;
+        }
+
+        private void SendLookInput(bool on)
+        {
+            RefreshLookCacheForJoins();
+            if (_lookInputSentValid && _lookInputSent == on) return;
+            _lookInputSent = on;
+            _lookInputSentValid = true;
+            playerInput.Server_LookInputRpc(on, playerInput.RpcTarget.Everyone);
+        }
+
+        private void SendLookAngle(short x, short y)
+        {
+            RefreshLookCacheForJoins();
+            if (_lookAngleSentValid && _lookAngleSentX == x && _lookAngleSentY == y) return;
+            _lookAngleSentX = x;
+            _lookAngleSentY = y;
+            _lookAngleSentValid = true;
+            playerInput.Server_LookAngleInputRpc(x, y, playerInput.RpcTarget.Everyone);
+        }
 
         private bool isIntermission = false;
         private int intermissionBehavior = -1;
@@ -173,18 +243,37 @@ namespace MaxPractice
                 rb.linearDamping = 4.0f;
                 rb.angularDamping = 0.5f;
 
-                var colliders = body.GetComponentsInChildren<Collider>();
-                foreach (var col in colliders)
+                Collider[] colliders = ResolvePhysicsColliders();
+                for (int i = 0; i < colliders.Length; i++)
                 {
-                    if (col != null && col.material != null)
-                    {
-                        col.material.dynamicFriction = 0.3f;
-                        col.material.staticFriction = 0.3f;
-                        col.material.frictionCombine = PhysicsMaterialCombine.Average;
-                    }
+                    Collider col = colliders[i];
+                    if (col == null || col.material == null) continue;
+
+                    col.material.dynamicFriction = 0.3f;
+                    col.material.staticFriction = 0.3f;
+                    col.material.frictionCombine = PhysicsMaterialCombine.Average;
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// The cached collider set, re-resolved if it is missing or any entry has been
+        /// destroyed - which is what a character respawn looks like from here.
+        /// </summary>
+        private Collider[] ResolvePhysicsColliders()
+        {
+            bool stale = _physicsColliders == null;
+            if (!stale)
+            {
+                for (int i = 0; i < _physicsColliders.Length; i++)
+                {
+                    if (_physicsColliders[i] == null) { stale = true; break; }
+                }
+            }
+
+            if (stale) _physicsColliders = body.GetComponentsInChildren<Collider>();
+            return _physicsColliders;
         }
 
         private void InitializeComponents()
@@ -221,16 +310,39 @@ namespace MaxPractice
                     catch { }
                 }
                 isRedTeam = newIsRed;
-                goalPos = isRedTeam ? redGoalPos : blueGoalPos;
+                goalPos = GoalGeometry.Get(isRedTeam ? PlayerTeam.Red : PlayerTeam.Blue);
             }
             catch { }
         }
+
+        /// <summary>Physics ticks since the last team-alignment refresh. See FixedUpdate.</summary>
+        private int _alignmentCounter;
+
+        /// <summary>
+        /// The body's colliders, resolved once. ResetGoaliePhysics re-asserts friction twice a
+        /// second to fight CompTweaks, and it used to re-walk the whole rigged hierarchy and
+        /// allocate a fresh array every time it did. The set only changes when the character
+        /// respawns, which shows up as a destroyed entry, so it is re-resolved then.
+        /// </summary>
+        private Collider[] _physicsColliders;
 
         private void FixedUpdate()
         {
             if (!aiEnabled) return;
 
-            if (Time.frameCount % 100 == 0) UpdateTeamAlignment();
+            // Counted in PHYSICS ticks, like _physicsResetCounter below. This was
+            // `Time.frameCount % 100 == 0`, which is wrong in both directions inside a
+            // FixedUpdate: frameCount is the RENDER frame and does not advance between the
+            // several FixedUpdates that can run within one of them, so every one of those
+            // saw the same value and re-ran the alignment together; and at a high frame rate
+            // it steps past multiples of 100 entirely, so on another machine the refresh
+            // might not happen for a very long time. 100 physics ticks is a flat 2 seconds
+            // on every client.
+            if (++_alignmentCounter >= 100)
+            {
+                _alignmentCounter = 0;
+                UpdateTeamAlignment();
+            }
 
             try
             {
@@ -269,6 +381,12 @@ namespace MaxPractice
             try
             {
                 if (Time.time < nextUpdateTime) return;
+
+                // Measure what ACTUALLY elapsed rather than assuming updateInterval. The
+                // throttle only fires on fixed-step boundaries, so the real gap is 0.04 s at
+                // 50 Hz physics, not 0.033.
+                _throttleDelta = _lastThrottleTime < 0f ? updateInterval : Time.time - _lastThrottleTime;
+                _lastThrottleTime = Time.time;
                 nextUpdateTime = Time.time + updateInterval;
 
                 UpdateSadState();
@@ -296,17 +414,23 @@ namespace MaxPractice
                 }
                 catch { return; }
 
+                // Hard clamp to the front of the net. Everything below this only nudges inputs
+                // and leans on timers to notice the goalie is out of position, so a shove — or
+                // a rink that just changed size underneath it — can leave it standing in its
+                // own net for over a second. Applied here so the sad / celebrate / intermission
+                // paths, which deliberately wander and return above, are left alone.
+                ClampInFrontOfGoal(ref currentPos);
+
                 try
                 {
                     if (body.HasFallen.Value || body.HasSlipped)
                     {
-                        fallenTimer += updateInterval;
+                        fallenTimer += _throttleDelta;
                         if (fallenTimer >= FALLEN_RESPAWN_DELAY)
                         {
                             Vector3 resetPos = goalPos;
                             resetPos.z += isRedTeam ? 1.2f : -1.2f;
                             resetPos.y = 0f;
-                            resetPos.x = 0f;
 
                             Quaternion resetRot = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
                             body.transform.position = resetPos;
@@ -336,12 +460,12 @@ namespace MaxPractice
 
                 bool behindGoalLine = isRedTeam ? (currentPos.z < goalPos.z - 0.5f) : (currentPos.z > goalPos.z + 0.5f);
                 bool tooFarFromCrease = Vector3.Distance(currentPos, goalPos) > 5f;
-                bool tooFarLateral = Mathf.Abs(currentPos.x) > 4f;
+                bool tooFarLateral = Mathf.Abs(currentPos.x - goalPos.x) > 4f;
                 bool goalieOutOfPosition = behindGoalLine || tooFarFromCrease || tooFarLateral;
 
                 if (behindGoalLine)
                 {
-                    stuckBehindNetTimer += updateInterval;
+                    stuckBehindNetTimer += _throttleDelta;
                     if (stuckBehindNetTimer >= STUCK_BEHIND_NET_TP_DELAY)
                     {
                         try
@@ -349,7 +473,6 @@ namespace MaxPractice
                             Vector3 resetPos = goalPos;
                             resetPos.z += isRedTeam ? 1.2f : -1.2f;
                             resetPos.y = 0f;
-                            resetPos.x = 0f;
                             body.transform.position = resetPos;
                             body.transform.rotation = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
                             if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
@@ -372,7 +495,6 @@ namespace MaxPractice
                         Vector3 resetPos = goalPos;
                         resetPos.z += isRedTeam ? 1.2f : -1.2f;
                         resetPos.y = 0f;
-                        resetPos.x = 0f;
                         body.transform.position = resetPos;
                         body.transform.rotation = Quaternion.LookRotation(isRedTeam ? Vector3.forward : Vector3.back);
                         if (rb != null) { rb.linearVelocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
@@ -398,7 +520,7 @@ namespace MaxPractice
 
                 if (puck == null)
                 {
-                    noPuckReturnTimer += updateInterval;
+                    noPuckReturnTimer += _throttleDelta;
                     trackedPuck = null;
 
                     if (noPuckReturnTimer > NO_PUCK_RETURN_DELAY)
@@ -444,7 +566,9 @@ namespace MaxPractice
                         return;
                     }
                     puckPos = puck.transform.position;
-                    puckVelocity = (puckPos - lastPuckPos) / updateInterval;
+                    // Real elapsed: lastPuckPos was sampled one THROTTLED tick ago (0.04 s
+                    // at 50 Hz), so dividing by the nominal 0.033 reported speeds ~21% high.
+                    puckVelocity = (puckPos - lastPuckPos) / _throttleDelta;
                     lastPuckPos = puckPos;
                 }
                 catch
@@ -463,7 +587,10 @@ namespace MaxPractice
                 float effectiveAggressionRange = puckHeadingToGoal ? aggressionRange * 1.5f : aggressionRange;
 
                 bool puckBehindGoalLine = isRedTeam ? (puckPos.z < goalPos.z) : (puckPos.z > goalPos.z);
-                bool puckInZone = isRedTeam ? (puckPos.z < 0) : (puckPos.z > 0);
+                // Centre ice is only world 0 when ArenaOffsetZ is 0, so "in my half" is
+                // measured against the midpoint of the two goal lines.
+                float centreIceZ = GoalGeometry.CentreIceZ;
+                bool puckInZone = isRedTeam ? (puckPos.z < centreIceZ) : (puckPos.z > centreIceZ);
                 bool puckInCrease = !puckBehindGoalLine && distToGoal < 3f;
 
                 if (puckBehindGoalLine)
@@ -495,7 +622,7 @@ namespace MaxPractice
 
                 if (puckSpeed < minPuckSpeed && distToPuck > 3f)
                 {
-                    slowPuckTimer += updateInterval;
+                    slowPuckTimer += _throttleDelta;
                     if (slowPuckTimer >= SLOW_PUCK_IGNORE_DELAY)
                     {
                         ResetInputs();
@@ -532,7 +659,7 @@ namespace MaxPractice
                     }
                     else
                     {
-                        Vector3 goalCenter = new Vector3(0f, 0f, goalPos.z);
+                        Vector3 goalCenter = new Vector3(goalPos.x, 0f, goalPos.z);
                         Vector3 puckToGoal = goalCenter - puckPos;
                         puckToGoal.y = 0;
                         float puckToGoalDist = puckToGoal.magnitude;
@@ -545,7 +672,7 @@ namespace MaxPractice
                         interceptPos = new Vector3(interceptOnLine.x, 0, comeOutZ);
                     }
 
-                    interceptPos.x = Mathf.Clamp(interceptPos.x, -goalWidth, goalWidth);
+                    interceptPos.x = Mathf.Clamp(interceptPos.x, goalPos.x - goalWidth, goalPos.x + goalWidth);
 
                     float minZ, maxZ;
                     if (isRedTeam) { minZ = goalPos.z; maxZ = goalPos.z + 3f; }
@@ -831,7 +958,11 @@ namespace MaxPractice
             if (!isSweeping || playerInput == null || body == null) return;
             try
             {
-                stickSweepTime += Time.fixedDeltaTime;
+                // Real elapsed, not fixedDeltaTime: UpdateStickSweep is called from the
+                // throttled block, which runs roughly every other fixed step, so accruing
+                // 0.02 per 0.04 s made the 0.15 s sweep span 0.30 s of wall clock and
+                // suppressed puck tracking for twice as long after every poke.
+                stickSweepTime += _throttleDelta;
                 float progress = stickSweepTime / stickSweepDuration;
 
                 float sweepProgress = Mathf.Sin(progress * Mathf.PI);
@@ -904,10 +1035,10 @@ namespace MaxPractice
 
                 playerInput.LookInput.ServerValue = true;
                 playerInput.LookAngleInput.ServerValue = new Vector2(pitch, yaw);
-                playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                SendLookInput(true);
                 short compX = NetworkingUtils.CompressFloatToShort(pitch, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                 short compY = NetworkingUtils.CompressFloatToShort(yaw, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                playerInput.Server_LookAngleInputRpc(compX, compY, playerInput.RpcTarget.Everyone);
+                SendLookAngle(compX, compY);
                 isLookingAtPuckBehind = true;
 
                 // Stick to the puck's side — yaw is already the body-relative angle to the puck.
@@ -926,7 +1057,7 @@ namespace MaxPractice
             try
             {
                 playerInput.LookInput.ServerValue = false;
-                playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+                SendLookInput(false);
             }
             catch { }
         }
@@ -946,7 +1077,12 @@ namespace MaxPractice
                 if (pucks == null || pucks.Count == 0) return null;
 
                 Puck closest = null;
-                float closestDist = float.MaxValue;
+
+                // Squared throughout: the 8 m cut-off and the closest-so-far comparison both
+                // order the same way under a square, so the root Vector3.Distance was taking
+                // for every puck on the ice, on every tick, on every goalie, bought nothing.
+                const float rangeSqr = 8f * 8f;
+                float closestSqr = float.MaxValue;
 
                 foreach (var puck in pucks)
                 {
@@ -958,9 +1094,9 @@ namespace MaxPractice
                         Vector3 pp = puck.transform.position;
                         bool isBehind = isRedTeam ? (pp.z < gPos.z) : (pp.z > gPos.z);
                         if (!isBehind) continue;
-                        float dist = Vector3.Distance(gPos, pp);
-                        if (dist > 8f) continue;
-                        if (dist < closestDist) { closestDist = dist; closest = puck; }
+                        float distSqr = (gPos - pp).sqrMagnitude;
+                        if (distSqr > rangeSqr) continue;
+                        if (distSqr < closestSqr) { closestSqr = distSqr; closest = puck; }
                     }
                     catch { continue; }
                 }
@@ -991,13 +1127,52 @@ namespace MaxPractice
         }
 
         /// <summary>
-        /// Compute a lateral bias toward the puck behind the net. 40% of the puck's X position,
-        /// clamped to ±1.0m so the goalie still stays inside the goal width (~1.5m half-width)
-        /// without exposing the far post.
+        /// Compute a lateral bias toward the puck behind the net, as an offset from the net's
+        /// own centre. 40% of the puck's offset from that centre, clamped to ±1.0m so the
+        /// goalie still stays inside the goal width (~1.5m half-width) without exposing the
+        /// far post.
         /// </summary>
         private float ComputeBehindNetCheat(Vector3 puckPos)
         {
-            return Mathf.Clamp(puckPos.x * 0.4f, -1.0f, 1.0f);
+            return Mathf.Clamp((puckPos.x - goalPos.x) * 0.4f, -1.0f, 1.0f);
+        }
+
+        /// <summary>
+        /// Keep the goalie on the centre-ice side of its own goal line, unconditionally.
+        /// Written to the transform rather than to the inputs so it holds no matter what put
+        /// the goalie back there, and the inward velocity component is dropped so it doesn't
+        /// simply re-cross on the next tick. currentPos is corrected in place so the rest of
+        /// the tick reasons about where the goalie now is.
+        /// </summary>
+        private const float FrontClampMargin = 0.05f;
+        private void ClampInFrontOfGoal(ref Vector3 currentPos)
+        {
+            try
+            {
+                if (body == null || body.transform == null) return;
+                // Never clamp against an unresolved goal line: pinning the goalie to a plane
+                // near world 0 would park it at centre ice, which is far worse than the
+                // out-of-position drift this is here to prevent.
+                if (Mathf.Abs(goalPos.z) < GoalGeometry.MinGoalLineZ) return;
+
+                float inward = isRedTeam ? 1f : -1f; // toward centre ice
+                float minZ = goalPos.z + inward * FrontClampMargin;
+                if ((currentPos.z - minZ) * inward >= 0f) return;
+
+                currentPos.z = minZ;
+                body.transform.position = currentPos;
+
+                if (rb != null)
+                {
+                    Vector3 velocity = rb.linearVelocity;
+                    if (velocity.z * inward < 0f)
+                    {
+                        velocity.z = 0f;
+                        rb.linearVelocity = velocity;
+                    }
+                }
+            }
+            catch { }
         }
 
         private void ReturnToCenter(Vector3 currentPos, Vector3 gPos, bool redTeam, float xBias = 0f)
@@ -1007,7 +1182,9 @@ namespace MaxPractice
             {
                 Vector3 targetCenter = gPos;
                 targetCenter.z += redTeam ? 1.2f : -1.2f;
-                targetCenter.x = xBias; // 0 = centered, ±ish = cheat toward a side
+                // xBias is an offset from the net's own centre, not a world X: on a rink with
+                // an ArenaOffsetX the net doesn't sit on world 0.
+                targetCenter.x = gPos.x + xBias; // 0 = centered, ±ish = cheat toward a side
 
                 Vector3 toCenter = targetCenter - currentPos;
                 toCenter.y = 0;
@@ -1242,7 +1419,9 @@ namespace MaxPractice
                         bool puckBehindGoalLine = isRedTeam ? (puckPos.z < gPos.z) : (puckPos.z > gPos.z);
                         if (puckBehindGoalLine) continue;
 
-                        float dist = Vector3.Distance(gPos, puckPos);
+                        // (A `float dist = Vector3.Distance(gPos, puckPos)` used to sit here.
+                        // Nothing read it - the score below is built from effectiveDist - so it
+                        // was a square root per puck, per tick, per goalie, for nothing.)
                         float puckSpeed = 0f;
                         float approachFactor = 0f;
                         if (puck.Rigidbody != null)
@@ -1285,7 +1464,7 @@ namespace MaxPractice
             try
             {
                 bool isRed = team == PlayerTeam.Red;
-                Vector3 gPos = isRed ? redGoalPos : blueGoalPos;
+                Vector3 gPos = GoalGeometry.Get(isRed ? PlayerTeam.Red : PlayerTeam.Blue);
                 Vector3 resetPos = gPos;
                 resetPos.z += isRed ? 1.2f : -1.2f;
                 resetPos.y = 0f;
@@ -1311,7 +1490,7 @@ namespace MaxPractice
                 try
                 {
                     playerInput.LookInput.ServerValue = false;
-                    playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+                    SendLookInput(false);
                 }
                 catch { }
             }
@@ -1320,12 +1499,12 @@ namespace MaxPractice
 
         private void UpdateIdle()
         {
-            idleTimer += updateInterval;
+            idleTimer += _throttleDelta;
             if (idleTimer < IDLE_DELAY) { isIdling = false; return; }
 
             isIdling = true;
-            idlePhase += updateInterval;
-            idleBehaviorTimer += updateInterval;
+            idlePhase += _throttleDelta;
+            idleBehaviorTimer += _throttleDelta;
 
             if (idleBehaviorTimer >= idleBehaviorDuration)
             {
@@ -1385,10 +1564,10 @@ namespace MaxPractice
                 {
                     playerInput.LookInput.ServerValue = true;
                     playerInput.LookAngleInput.ServerValue = new Vector2(lookV, lookH);
-                    playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                    SendLookInput(true);
                     short compX = NetworkingUtils.CompressFloatToShort(lookV, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                     short compY = NetworkingUtils.CompressFloatToShort(lookH, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                    playerInput.Server_LookAngleInputRpc(compX, compY, playerInput.RpcTarget.Everyone);
+                    SendLookAngle(compX, compY);
                 }
             }
             catch { }
@@ -1416,8 +1595,8 @@ namespace MaxPractice
         {
             if (!isCelebrating) return;
 
-            celebrateTimer -= updateInterval;
-            celebratePhase += updateInterval;
+            celebrateTimer -= _throttleDelta;
+            celebratePhase += _throttleDelta;
 
             if (celebrateTimer <= 0f)
             {
@@ -1425,7 +1604,7 @@ namespace MaxPractice
                 try
                 {
                     playerInput.LookInput.ServerValue = false;
-                    playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+                    SendLookInput(false);
                 }
                 catch { }
                 return;
@@ -1456,7 +1635,7 @@ namespace MaxPractice
                     // SPIN mode — rotate body in place, stick held up high.
                     if (body != null && body.transform != null)
                     {
-                        body.transform.Rotate(Vector3.up, 540f * updateInterval); // ~1.5 rps
+                        body.transform.Rotate(Vector3.up, 540f * _throttleDelta); // ~1.5 rps
                     }
                     // Stick raised, slight wobble.
                     float stickVSpin = -25f + Mathf.Sin(celebratePhase * 6f) * 5f;
@@ -1480,10 +1659,10 @@ namespace MaxPractice
                 // Look RPC replication — same for both modes.
                 playerInput.LookInput.ServerValue = true;
                 playerInput.LookAngleInput.ServerValue = new Vector2(lookV, lookH);
-                playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                SendLookInput(true);
                 short compX = NetworkingUtils.CompressFloatToShort(lookV, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                 short compY = NetworkingUtils.CompressFloatToShort(lookH, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                playerInput.Server_LookAngleInputRpc(compX, compY, playerInput.RpcTarget.Everyone);
+                SendLookAngle(compX, compY);
 
                 // Bounce: invoke PlayerBody.Jump() directly every CELEBRATE_JUMP_INTERVAL.
                 // Going through JumpInput.ServerValue += 1 relies on the body polling the
@@ -1523,14 +1702,14 @@ namespace MaxPractice
         private void UpdateSadState()
         {
             if (!isSad) return;
-            sadTimer -= updateInterval;
+            sadTimer -= _throttleDelta;
             if (sadTimer <= 0f)
             {
                 isSad = false;
                 try
                 {
                     playerInput.LookInput.ServerValue = false;
-                    playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+                    SendLookInput(false);
                 }
                 catch { }
                 return;
@@ -1555,13 +1734,13 @@ namespace MaxPractice
 
                 // Look down (sad) or up (why me?!) and replicate via RPC.
                 playerInput.LookInput.ServerValue = true;
-                playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                SendLookInput(true);
                 Vector2 sadAngle = sadLookUp ? new Vector2(-25f, 0f) : new Vector2(75f, 0f);
                 playerInput.LookAngleInput.ServerValue = sadAngle;
 
                 short compX = NetworkingUtils.CompressFloatToShort(sadAngle.x, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                 short compY = NetworkingUtils.CompressFloatToShort(sadAngle.y, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                playerInput.Server_LookAngleInputRpc(compX, compY, playerInput.RpcTarget.Everyone);
+                SendLookAngle(compX, compY);
             }
             catch { }
         }
@@ -1601,7 +1780,7 @@ namespace MaxPractice
             try
             {
                 playerInput.LookInput.ServerValue = false;
-                playerInput.Server_LookInputRpc(false, playerInput.RpcTarget.Everyone);
+                SendLookInput(false);
             }
             catch { }
         }
@@ -1610,8 +1789,8 @@ namespace MaxPractice
         {
             if (!isIntermission || playerInput == null || body == null) return;
 
-            intermissionTimer += updateInterval;
-            intermissionPhase += updateInterval;
+            intermissionTimer += _throttleDelta;
+            intermissionPhase += _throttleDelta;
 
             try
             {
@@ -1629,10 +1808,10 @@ namespace MaxPractice
                         playerInput.LookInput.ServerValue = true;
                         float lookH = Mathf.Sin(intermissionPhase * 2f) * 25f;
                         playerInput.LookAngleInput.ServerValue = new Vector2(25f, lookH);
-                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        SendLookInput(true);
                         short cx0 = NetworkingUtils.CompressFloatToShort(25f, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                         short cy0 = NetworkingUtils.CompressFloatToShort(lookH, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                        playerInput.Server_LookAngleInputRpc(cx0, cy0, playerInput.RpcTarget.Everyone);
+                        SendLookAngle(cx0, cy0);
                         break;
                     }
 
@@ -1641,15 +1820,15 @@ namespace MaxPractice
                         playerInput.SlideInput.ServerValue = false;
                         playerInput.MoveInput.ServerValue = Vector2.zero;
 
-                        if (rb != null) body.transform.Rotate(Vector3.up, 360f * updateInterval);
+                        if (rb != null) body.transform.Rotate(Vector3.up, 360f * _throttleDelta);
 
                         playerInput.StickRaycastOriginAngleInput.ServerValue = new Vector2(15f, 45f);
                         playerInput.LookInput.ServerValue = true;
                         playerInput.LookAngleInput.ServerValue = new Vector2(10f, 0f);
-                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        SendLookInput(true);
                         short cx1 = NetworkingUtils.CompressFloatToShort(10f, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                         short cy1 = NetworkingUtils.CompressFloatToShort(0f, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                        playerInput.Server_LookAngleInputRpc(cx1, cy1, playerInput.RpcTarget.Everyone);
+                        SendLookAngle(cx1, cy1);
                         break;
                     }
 
@@ -1663,10 +1842,10 @@ namespace MaxPractice
 
                             playerInput.LookInput.ServerValue = true;
                             playerInput.LookAngleInput.ServerValue = new Vector2(75f, 0f);
-                            playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                            SendLookInput(true);
                             short cx2 = NetworkingUtils.CompressFloatToShort(75f, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                             short cy2 = NetworkingUtils.CompressFloatToShort(0f, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                            playerInput.Server_LookAngleInputRpc(cx2, cy2, playerInput.RpcTarget.Everyone);
+                            SendLookAngle(cx2, cy2);
                         }
                         ResetInputs();
                         break;
@@ -1682,7 +1861,7 @@ namespace MaxPractice
                             Mathf.Clamp(moveX, -1f, 1f),
                             Mathf.Clamp(isRedTeam ? moveZ : -moveZ, -1f, 1f));
 
-                        intermissionDashTimer += updateInterval;
+                        intermissionDashTimer += _throttleDelta;
                         if (intermissionDashTimer > 0.15f)
                         {
                             intermissionDashTimer = 0f;
@@ -1703,7 +1882,7 @@ namespace MaxPractice
                     {
                         playerInput.SlideInput.ServerValue = true;
 
-                        intermissionDashTimer += updateInterval;
+                        intermissionDashTimer += _throttleDelta;
                         if (intermissionDashTimer > 0.3f)
                         {
                             intermissionDashTimer = 0f;
@@ -1724,10 +1903,10 @@ namespace MaxPractice
                         float lookV4 = 25f + Mathf.Sin(intermissionPhase * 4f) * 15f;
                         float lookH4 = Mathf.Sin(intermissionPhase * 3f) * 20f;
                         playerInput.LookAngleInput.ServerValue = new Vector2(lookV4, lookH4);
-                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        SendLookInput(true);
                         short vx4 = NetworkingUtils.CompressFloatToShort(lookV4, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                         short vy4 = NetworkingUtils.CompressFloatToShort(lookH4, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                        playerInput.Server_LookAngleInputRpc(vx4, vy4, playerInput.RpcTarget.Everyone);
+                        SendLookAngle(vx4, vy4);
                         break;
                     }
 
@@ -1744,10 +1923,10 @@ namespace MaxPractice
                         float lookH5 = Mathf.Sin(intermissionPhase * 2.5f) * 50f;
                         float lookV5 = 20f + Mathf.Sin(intermissionPhase * 1.8f) * 20f;
                         playerInput.LookAngleInput.ServerValue = new Vector2(lookV5, lookH5);
-                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        SendLookInput(true);
                         short wx5 = NetworkingUtils.CompressFloatToShort(lookV5, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                         short wy5 = NetworkingUtils.CompressFloatToShort(lookH5, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                        playerInput.Server_LookAngleInputRpc(wx5, wy5, playerInput.RpcTarget.Everyone);
+                        SendLookAngle(wx5, wy5);
                         break;
                     }
 
@@ -1764,10 +1943,10 @@ namespace MaxPractice
                         playerInput.LookInput.ServerValue = true;
                         float lookV6 = slideOn ? 50f : 25f;
                         playerInput.LookAngleInput.ServerValue = new Vector2(lookV6, 0f);
-                        playerInput.Server_LookInputRpc(true, playerInput.RpcTarget.Everyone);
+                        SendLookInput(true);
                         short bx6 = NetworkingUtils.CompressFloatToShort(lookV6, playerInput.MinimumLookAngle.x, playerInput.MaximumLookAngle.x);
                         short by6 = NetworkingUtils.CompressFloatToShort(0f, playerInput.MinimumLookAngle.y, playerInput.MaximumLookAngle.y);
-                        playerInput.Server_LookAngleInputRpc(bx6, by6, playerInput.RpcTarget.Everyone);
+                        SendLookAngle(bx6, by6);
                         break;
                     }
                 }

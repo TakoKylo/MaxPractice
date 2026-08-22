@@ -1,4 +1,4 @@
-// PracticeHelpers.cs - Utility functions for MaxPractice
+﻿// PracticeHelpers.cs - Utility functions for MaxPractice
 
 using System;
 using System.Collections.Generic;
@@ -30,20 +30,45 @@ namespace MaxPractice
         private static bool _visualsCached = false;
         
         /// <summary>
+        /// True only while the game is in warmup - the one phase this mod is allowed to
+        /// act in.
+        ///
+        /// Every practice command already goes through the gate in
+        /// PracticeCommandPatch.HandlePracticeCommand, but that gate is checked once, at
+        /// the moment the command is typed. Anything that outlives that instant - a
+        /// coroutine sitting on a WaitForSeconds, a sampling loop, a periodic sweep -
+        /// has to ask again, because the phase can and does change underneath it.
+        /// Returning false when GameManager is missing is deliberate: no phase means no
+        /// practice.
+        /// </summary>
+        public static bool IsWarmup
+        {
+            get
+            {
+                var gm = NetworkBehaviourSingleton<GameManager>.Instance;
+                return gm != null && gm.Phase == GamePhase.Warmup;
+            }
+        }
+
+        /// <summary>
         /// Get a unique ID for a player - prefers OwnerClientId for server reliability
         /// </summary>
         public static ulong GetSteamIdFromPlayer(Player p)
         {
             try
             {
-                // Prefer OwnerClientId - it's the most reliable on dedicated servers
-                if (p?.NetworkObject != null && p.NetworkObject.OwnerClientId != 0)
+                // Prefer OwnerClientId - it's the most reliable on dedicated servers.
+                // Plain != null, not ?. : the null-conditional operator is a reference test
+                // and deliberately bypasses UnityEngine.Object's overloaded ==, so on a
+                // DESTROYED Player it proceeds to read the member and throws
+                // MissingReferenceException. Unity's != short-circuits instead.
+                if (p != null && p.NetworkObject != null && p.NetworkObject.OwnerClientId != 0)
                 {
                     return p.NetworkObject.OwnerClientId;
                 }
-                
+
                 // Fallback to SteamId if available
-                if (p?.SteamId != null)
+                if (p != null && p.SteamId != null)
                 {
                     var steamIdValue = p.SteamId.Value;
                     if (ulong.TryParse(steamIdValue.ToString(), out ulong val) && val != 0)
@@ -63,9 +88,20 @@ namespace MaxPractice
         // ChatMessage-struct overload would let us set Username/SteamID/etc, but with those
         // fields null the client-side AddChatMessage drops the message silently. The string
         // overloads build a proper system ChatMessage server-side and ship it intact.
+        /// <summary>
+        /// "Send this to everyone" marker for the chat helpers.
+        ///
+        /// This used to be 0, which is not a spare value: 0 is NetworkManager.ServerClientId,
+        /// and on a listen server that is the host's own real client id. So every message
+        /// meant privately for the host - cooldown refusals, command errors, /practice's
+        /// whole help listing - was broadcast to the entire server instead. ulong.MaxValue
+        /// is never a real client id, so the two cases can no longer be confused.
+        /// </summary>
+        public const ulong BroadcastClientId = ulong.MaxValue;
+
         private struct PendingChatSend
         {
-            public ulong ClientId; // 0 = broadcast to everyone
+            public ulong ClientId; // BroadcastClientId = broadcast to everyone
             public string Content;
         }
         private static readonly Queue<PendingChatSend> _pendingChatSends = new Queue<PendingChatSend>();
@@ -84,6 +120,17 @@ namespace MaxPractice
 
         public static void FlushPendingChats()
         {
+            // Cheapest test first. This is pumped every frame from PracticeManager.Update on
+            // the server and the queue is empty on virtually all of those frames, but the
+            // manager was being resolved before anyone asked whether there was anything to
+            // send - and when the singleton is not up yet (menu, level load, a dedicated
+            // server before the first scene) that fell through to a whole-scene
+            // FindFirstObjectByType<ChatManager>, every frame, forever.
+            lock (_pendingChatSends)
+            {
+                if (_pendingChatSends.Count == 0) return;
+            }
+
             ChatManager chatManager = NetworkBehaviourSingleton<ChatManager>.Instance;
             if (chatManager == null)
                 chatManager = UnityEngine.Object.FindFirstObjectByType<ChatManager>();
@@ -99,7 +146,7 @@ namespace MaxPractice
                 }
                 try
                 {
-                    if (pending.ClientId == 0UL)
+                    if (pending.ClientId == BroadcastClientId)
                         chatManager.Server_BroadcastChatMessage(pending.Content);
                     else
                         chatManager.Server_SendChatMessage(pending.Content, null, new ulong[] { pending.ClientId });
@@ -109,10 +156,12 @@ namespace MaxPractice
         }
 
         /// <summary>
-        /// Send a system chat message. clientId=0 broadcasts to everyone; otherwise targets that client.
+        /// Send a system chat message. Omitting clientId (or passing <see cref="BroadcastClientId"/>)
+        /// broadcasts to everyone; any other value targets that one client — including 0, which is
+        /// the host's own client id on a listen server.
         /// The first parameter (UIChat) is unused — kept for back-compat with existing call sites.
         /// </summary>
-        public static void SendChatMessage(UIChat ui, string message, ulong clientId = 0)
+        public static void SendChatMessage(UIChat ui, string message, ulong clientId = BroadcastClientId)
         {
             try { EnqueueSystemChat(clientId, message); }
             catch { }
@@ -212,19 +261,28 @@ namespace MaxPractice
             // Try cache first
             if (_playerCache.TryGetValue(steamId, out Player cached))
             {
+                // A cached null is a remembered MISS - honour it until the cache expires
+                // rather than re-scanning, which is the point of caching misses at all.
+                if (ReferenceEquals(cached, null)) return null;
+
                 // Validate cached player is still valid
                 if (cached != null && cached.gameObject != null)
                     return cached;
-                // Invalid - remove from cache
+                // Destroyed since - drop it and re-look-up.
                 _playerCache.Remove(steamId);
             }
             
-            // Cache miss - do lookup
+            // Cache miss - do lookup.
+            //
+            // MISSES are cached too (as null). Without that, an id that cannot resolve -
+            // a player mid-respawn, or a stale entry in YoyoPlayers - re-ran the full
+            // PlayerManager scan on EVERY call, and YoyoStringNetwork.BuildCurrentSet calls
+            // this once per yoyo pair per frame. The scan allocates a string per player it
+            // walks past, so one unresolvable id turned into a steady per-frame allocation
+            // that never self-corrected. The whole cache still clears every
+            // PLAYER_CACHE_DURATION, so a null entry costs at most that long.
             Player found = FindPlayerBySteamIdUncached(steamId);
-            if (found != null)
-            {
-                _playerCache[steamId] = found;
-            }
+            _playerCache[steamId] = found;
             return found;
         }
         
@@ -397,8 +455,13 @@ namespace MaxPractice
             
             try
             {
-                var meshRenderers = puck.GetComponentsInChildren<MeshRenderer>(true);
-                var meshFilters = puck.GetComponentsInChildren<MeshFilter>(true);
+                // Skip anything belonging to a cone visual. Its renderer would read
+                // as "valid puck visuals" and get cached as the known-good puck
+                // mesh, which would then be stamped onto ordinary pucks.
+                var meshRenderers = puck.GetComponentsInChildren<MeshRenderer>(true)
+                                        .Where(mr => !ConeAsset.IsConePart(mr)).ToArray();
+                var meshFilters = puck.GetComponentsInChildren<MeshFilter>(true)
+                                      .Where(mf => !ConeAsset.IsConePart(mf)).ToArray();
                 
                 bool hasValidVisuals = false;
                 foreach (var mr in meshRenderers)
@@ -625,7 +688,9 @@ namespace MaxPractice
             
             try
             {
-                // Get all colliders on the handle puck
+                // Get all colliders on the handle puck. A cone puck has its own
+                // colliders switched off in favour of the cone's - Physics.IgnoreCollision
+                // errors out on a disabled collider, so only pass live ones.
                 var handleColliders = handlePuck.GetComponentsInChildren<Collider>(true);
                 if (handleColliders == null || handleColliders.Length == 0) return;
                 
@@ -642,10 +707,10 @@ namespace MaxPractice
                         
                         foreach (var hCol in handleColliders)
                         {
-                            if (hCol == null) continue;
+                            if (hCol == null || !hCol.enabled) continue;
                             foreach (var bCol in bodyColliders)
                             {
-                                if (bCol != null)
+                                if (bCol != null && bCol.enabled)
                                     Physics.IgnoreCollision(hCol, bCol, true);
                             }
                         }
@@ -659,15 +724,228 @@ namespace MaxPractice
         }
         
         /// <summary>
+        /// True when nothing already placed by /cones or /minefield sits within
+        /// <paramref name="minSeparation"/> of this spot.
+        ///
+        /// Checked against every player's handle pucks, not just the caller's - two
+        /// players laying out drills in the same corner shouldn't interleave their
+        /// cones. Distance is measured on the ice plane; height doesn't matter,
+        /// since everything here is sitting on it.
+        /// </summary>
+        public static bool IsHandleSpotClear(Vector3 position, float minSeparation)
+        {
+            float minSqr = minSeparation * minSeparation;
+
+            foreach (var kvp in MaxPracticePlugin.HandlePucks)
+            {
+                var pucks = kvp.Value;
+                if (pucks == null) continue;
+
+                foreach (var puck in pucks)
+                {
+                    if (puck == null) continue;
+
+                    Vector3 delta = puck.transform.position - position;
+                    delta.y = 0f;
+                    if (delta.sqrMagnitude < minSqr) return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Spawn a frozen puck to act as a prop's anchor, and dress it.
+        ///
+        /// Unlike a cone, these are placed deliberately and have a heading that
+        /// matters, so the puck is frozen immediately rather than after a settle
+        /// delay - a shooter that rolled a foot before locking would be aimed at
+        /// nothing. Its rotation carries the prop's heading to clients, since
+        /// Netcode replicates the puck transform but not the mesh riding on it.
+        /// </summary>
+        public static Puck SpawnPropPuck(Vector3 position, Quaternion rotation, PropKind kind, ulong ownerSteamId)
+        {
+            var puck = SpawnPuckWithCleanup(position, rotation, Vector3.zero, false);
+            if (puck == null) return null;
+
+            try
+            {
+                var stickCollider = puck.StickCollider;
+                if (stickCollider != null) stickCollider.enabled = false;
+            }
+            catch { }
+
+            var rb = puck.Rigidbody;
+            if (rb != null)
+            {
+                rb.isKinematic = true;
+                rb.constraints = RigidbodyConstraints.FreezeAll;
+                // The prop is posed by hand, never simulated, so interpolation has nothing
+                // useful to smooth and can only smear a re-aim back toward the old pose.
+                rb.interpolation = RigidbodyInterpolation.None;
+            }
+
+            // Tracked as a handle puck so /clearall and the phase-change cleanup
+            // already know how to get rid of it.
+            if (!MaxPracticePlugin.HandlePucks.ContainsKey(ownerSteamId))
+                MaxPracticePlugin.HandlePucks[ownerSteamId] = new System.Collections.Generic.List<Puck>();
+            MaxPracticePlugin.HandlePucks[ownerSteamId].Add(puck);
+
+            MaxPracticePlugin.PropPucks[puck] = kind;
+            MaxPracticePlugin.PropOwner[puck] = ownerSteamId;
+
+            // Pass the owner through so a host builds the same nameplate and team colour
+            // a remote client builds from the announcement.
+            PropNetwork.ApplyLocal(puck, kind, true, FindPlayerBySteamId(ownerSteamId));
+            PropNetwork.Announce();
+            SetupHandlePuckCollisionIgnoring(puck);
+
+            return puck;
+        }
+
+        /// <summary>
+        /// Put the puck shooter at a player's saved pass position, aimed at them.
+        /// Replaces any shooter they already had, so it follows /pass around rather
+        /// than leaving a machine behind at every spot they've stood.
+        /// </summary>
+        /// <summary>How far the shooter tilts up for a lob pass.</summary>
+        private const float LobPitchDegrees = 24f;
+
+        /// <returns>
+        /// false when the machine could not be placed. The old one is cleared first either
+        /// way - it holds a puck slot, so releasing it is what lets the replacement through
+        /// at the puck cap - which means a failure leaves the player with no shooter at all.
+        /// Passes still work (PlayerPassSettings is separate) but fire from the bare blade
+        /// point, because TryGetMuzzle has nothing to find, so the caller has to say so
+        /// rather than reporting success.
+        /// </returns>
+        public static bool SetShooter(ulong ownerSteamId, Vector3 passFrom, Vector3 aimAt)
+        {
+            ClearShooter(ownerSteamId);
+
+            Vector3 pos = passFrom;
+            pos.y = RinkSheets.IceHeightAt(pos, 0.08f);
+
+            Vector3 dir = aimAt - pos;
+            dir.y = 0f;
+            Quaternion rot = dir.sqrMagnitude > 1e-6f
+                ? Quaternion.LookRotation(dir.normalized, Vector3.up)
+                : Quaternion.identity;
+
+            // A lob is a high pass, so the machine should be aiming high. The tilt goes on
+            // the ANCHOR PUCK rather than the visual: puck rotation is already replicated,
+            // so ShooterVisual picks the pitch up on every client with nothing added to the
+            // prop announcement. Negative X tilts the local forward axis upward.
+            if (YoyoManager.PlayerPassSettings.TryGetValue(ownerSteamId, out var passSettings)
+                && passSettings != null && passSettings.IsLob)
+            {
+                rot *= Quaternion.Euler(-LobPitchDegrees, 0f, 0f);
+            }
+
+            var puck = SpawnPropPuck(pos, rot, PropKind.Shooter, ownerSteamId);
+            if (puck == null) return false;
+
+            MaxPracticePlugin.PlayerShooter[ownerSteamId] = puck;
+            return true;
+        }
+
+        public static void ClearShooter(ulong ownerSteamId)
+        {
+            if (MaxPracticePlugin.PlayerShooter.TryGetValue(ownerSteamId, out var existing) && existing != null)
+                MaxPracticePlugin.DestroyProp(existing);
+            MaxPracticePlugin.PlayerShooter.Remove(ownerSteamId);
+        }
+
+        /// <summary>
+        /// Where a player's shooter actually fires from. Passes spawn here rather
+        /// than at the saved blade point, so the puck leaves the muzzle instead of
+        /// appearing somewhere inside the machine.
+        /// </summary>
+        public static bool TryGetMuzzle(ulong ownerSteamId, out Vector3 world)
+        {
+            world = Vector3.zero;
+
+            if (!MaxPracticePlugin.PlayerShooter.TryGetValue(ownerSteamId, out var puck) || puck == null)
+                return false;
+
+            var visual = puck.GetComponentInChildren<ShooterVisual>(true);
+            if (visual == null) return false;
+
+            world = visual.transform.TransformPoint(ShooterAsset.MuzzleLocal);
+            return true;
+        }
+
+        /// <summary>Swing a player's shooter round to face where the next pass is going.</summary>
+        public static void AimShooter(ulong ownerSteamId, Vector3 target)
+        {
+            if (!MaxPracticePlugin.PlayerShooter.TryGetValue(ownerSteamId, out var puck) || puck == null)
+                return;
+
+            // Take the lob tilt from the SETTINGS, which is where it is decided, rather than
+            // reading it back off the transform we are about to overwrite.
+            float pitch = 0f;
+            if (YoyoManager.PlayerPassSettings.TryGetValue(ownerSteamId, out var settings)
+                && settings != null && settings.IsLob)
+            {
+                pitch = -LobPitchDegrees;
+            }
+
+            AimPropAt(puck, target, false, pitch);
+        }
+
+        /// <summary>
+        /// Point a prop's anchor puck at a world position. The rotation replicates, so
+        /// clients see it swing round too.
+        /// </summary>
+        /// <param name="pitchDegrees">
+        /// Tilt about the prop's local X after the yaw - negative aims up. Passed in by the
+        /// caller rather than recovered from the transform: reading the old pitch back out
+        /// of rotation.eulerAngles round-trips a quaternion through a decomposition that is
+        /// not unique, and feeding that straight back into the same transform every pass is
+        /// exactly the kind of loop that ends up pinned or flipped. Callers with no tilt
+        /// (cones, nets) pass 0 and get the plain level aim this always had.
+        /// </param>
+        public static void AimPropAt(Puck puck, Vector3 target, bool faceAway = false, float pitchDegrees = 0f)
+        {
+            if (puck == null || puck.transform == null) return;
+
+            Vector3 dir = target - puck.transform.position;
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 1e-6f) return;
+
+            if (faceAway) dir = -dir;
+
+            Quaternion aim = Mathf.Abs(pitchDegrees) < 0.01f
+                ? Quaternion.LookRotation(dir.normalized, Vector3.up)
+                : Quaternion.LookRotation(dir.normalized, Vector3.up) * Quaternion.Euler(pitchDegrees, 0f, 0f);
+
+            puck.transform.rotation = aim;
+
+            // And the RIGIDBODY, not just the transform.
+            //
+            // A prop anchor is frozen kinematic with FreezeAll (SpawnPropPuck), and for a
+            // Rigidbody the physics sync treats rb.rotation as the authority: a
+            // transform-only poke is put straight back on the next sync, and rb.rotation is
+            // also the pose the game's SynchronizedObject layer samples to replicate. The
+            // machine's SPAWN heading survives because it rides the spawn payload, so the
+            // symptom is a shooter that stands up pointing the right way and then never
+            // turns again however many passes fire.
+            var rb = puck.Rigidbody;
+            if (rb != null) rb.rotation = aim;
+        }
+
+        /// <summary>
         /// Spawn a handle puck that initializes normally, then gets frozen after a short delay.
         /// Collision ignoring and stick collision disabled immediately to prevent physics chaos.
         /// Puck is frozen after the delay.
+        /// When <paramref name="asCone"/> is set the puck is dressed as a traffic cone
+        /// (see ConeAsset) and announced to clients so everyone sees the same thing.
         /// </summary>
-        public static System.Collections.IEnumerator SpawnHandlePuckDelayed(Vector3 position, ulong ownerSteamId)
+        public static System.Collections.IEnumerator SpawnHandlePuckDelayed(Vector3 position, ulong ownerSteamId, bool asCone = false)
         {
             var puck = SpawnPuckWithCleanup(position, Quaternion.identity, Vector3.zero, false);
             if (puck == null) yield break;
-            
+
             // IMMEDIATELY disable stick collision so players can't interact with handle pucks
             try
             {
@@ -675,15 +953,25 @@ namespace MaxPractice
                 if (stickCollider != null) stickCollider.enabled = false;
             }
             catch { }
-            
+
             // IMMEDIATELY set up collision ignoring to prevent physics chaos
             SetupHandlePuckCollisionIgnoring(puck);
-            
+
             // Add to the owner's handle puck list immediately so cleanup tracks it
             if (!MaxPracticePlugin.HandlePucks.ContainsKey(ownerSteamId))
                 MaxPracticePlugin.HandlePucks[ownerSteamId] = new System.Collections.Generic.List<Puck>();
             MaxPracticePlugin.HandlePucks[ownerSteamId].Add(puck);
-            
+
+            // Swap it before the initialization delay so nobody sees a puck sitting
+            // there for a moment first. withCollision: this is the server, which
+            // owns physics - the cone's own shape replaces the puck's disc.
+            if (asCone)
+            {
+                MaxPracticePlugin.PropPucks[puck] = PropKind.Cone;
+                ConeAsset.Apply(puck, true);
+                PropNetwork.Announce();
+            }
+
             // Wait a short moment for the puck to fully initialize (network sync, visuals, etc)
             yield return new WaitForSeconds(0.15f);
             

@@ -1,8 +1,18 @@
-// MaxPracticeUI.cs - ModMenuHub UI for MaxPractice
+﻿// MaxPracticeUI.cs - F3 practice menu.
+//
+// Styled to match Ponce Arena's panel so a server running both doesn't feel like
+// two different mods: same centred modal geometry, same palette, same section /
+// row / tab construction, same game-font enforcement.
+//
+// Opens on F3. The old PonceMods.Shared.ModMenuHub registration is gone - this
+// panel is the only way in, so it owns its own cursor and player-input handling.
+//
+// Content is organised by what you're trying to do rather than by mechanism: each
+// command is a fixed row carrying its own description and its own bind slots, so
+// the separate "Help" tab that used to restate the same list is no longer needed.
 
 using System;
 using System.Collections.Generic;
-using System.Reflection;
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.UIElements;
@@ -12,23 +22,203 @@ namespace MaxPractice
 {
     public class MaxPracticeUI : MonoBehaviour
     {
+        // ------------------------------------------------------------------
+        // Design system - values lifted from Ponce Arena's panel
+        // ------------------------------------------------------------------
+
+        private static readonly Color PanelBg = new Color32(20, 20, 24, 245);
+        private static readonly Color PanelBorder = new Color32(48, 48, 56, 255);
+        private static readonly Color SectionBg = new Color32(26, 26, 32, 255);
+        private static readonly Color SectionBorder = new Color32(38, 38, 46, 255);
+        private static readonly Color RowBg = new Color32(34, 34, 40, 255);
+        private static readonly Color RowBgHover = new Color32(44, 44, 52, 255);
+        private static readonly Color ButtonBg = new Color32(48, 48, 56, 255);
+        private static readonly Color TabActiveBg = new Color32(34, 34, 40, 255);
+        private static readonly Color TabInactiveBg = new Color32(24, 24, 30, 255);
+        private static readonly Color Backdrop = new Color32(0, 0, 0, 140);
+        private static readonly Color Accent = new Color32(220, 80, 80, 255);
+        private static readonly Color AccentDim = new Color32(146, 53, 53, 255);
+        private static readonly Color Danger = new Color32(220, 80, 80, 255);
+        private static readonly Color TextPrimary = new Color32(240, 240, 245, 255);
+        private static readonly Color TextMuted = new Color32(155, 155, 165, 255);
+        private static readonly Color TextDim = new Color32(110, 110, 120, 255);
+        private static readonly Color CaptureBg = new Color32(100, 80, 40, 255);
+
+        private const float ROW_RADIUS = 6f;
+        private const float BTN_RADIUS = 5f;
+
+        // ------------------------------------------------------------------
+        // Command catalogue
+        // ------------------------------------------------------------------
+
+        private sealed class CmdDef
+        {
+            public string Name;
+            public string Command;
+            public string Detail;
+            public Func<bool> ServerEnabled;   // null = the server can't switch it off
+        }
+
+        private sealed class CmdGroup
+        {
+            public string Title;
+            public string Subtitle;
+            public CmdDef[] Items;
+            public string Footnote;   // credit / caveat printed under the group's rows
+        }
+
+        private static MaxPractice.ModConfig Cfg => ConfigManager.Config;
+
+        private static readonly CmdGroup[] CATALOGUE =
+        {
+            new CmdGroup
+            {
+                Title = "Puck spawning",
+                Items = new[]
+                {
+                    new CmdDef { Name = "Spawn puck", Command = "/s", Detail = "Spawn a puck above your stick.", ServerEnabled = () => Cfg.EnableSpawnPuck },
+                    new CmdDef { Name = "Backpass", Command = "/backpass", Detail = "Spawn a puck behind you that passes onto your stick.", ServerEnabled = () => Cfg.EnableBackpass },
+                    new CmdDef { Name = "Pass", Command = "/pass", Detail = "Set a pass position with your blade. A puck shooter appears there and feeds you. Run again to fire one.", ServerEnabled = () => Cfg.EnablePass },
+                    new CmdDef { Name = "Clear pass", Command = "/unpass", Detail = "Forget the pass position and remove the shooter.", ServerEnabled = () => Cfg.EnablePass },
+                    new CmdDef { Name = "Pop", Command = "/pop", Detail = "Pop the last puck you touched straight up.", ServerEnabled = () => Cfg.EnablePop },
+                }
+            },
+            new CmdGroup
+            {
+                Title = "Stickhandling",
+                Subtitle = "Frozen cones you can skate and stickhandle around. They stop pucks, not you.",
+                Items = new[]
+                {
+                    new CmdDef { Name = "Cones", Command = "/cones", Detail = "Five cones in a line in front of you.", ServerEnabled = () => Cfg.EnableCones },
+                    new CmdDef { Name = "Minefield", Command = "/minefield", Detail = "Ten cones scattered around you.", ServerEnabled = () => Cfg.EnableMinefield },
+                    new CmdDef { Name = "Clear cones", Command = "/clearcones", Detail = "Remove your cones and reset the use counter." },
+                    new CmdDef { Name = "Clear minefield", Command = "/clearminefield", Detail = "Remove your scattered cones." },
+                }
+            },
+            new CmdGroup
+            {
+                Title = "Shooting",
+                Subtitle = "A net to shoot at, one per player.",
+                Items = new[]
+                {
+                    new CmdDef { Name = "Mini net", Command = "/mininet", Detail = "Drop a small net ahead of you. It swallows any puck you put in it, so the ice stays clear.", ServerEnabled = () => Cfg.EnableMiniNet },
+                    new CmdDef { Name = "Clear mini net", Command = "/clearmininet", Detail = "Take your net away.", ServerEnabled = () => Cfg.EnableMiniNet },
+                }
+            },
+            new CmdGroup
+            {
+                Title = "Drills",
+                Items = new[]
+                {
+                    new CmdDef { Name = "Save practice", Command = "/saveprac", Detail = "Two minutes of shots at varying angles, speeds and targets. Goalies only.", ServerEnabled = () => Cfg.EnableSavePrac },
+                    new CmdDef { Name = "Stop save practice", Command = "/stopsaveprac", Detail = "End the drill early.", ServerEnabled = () => Cfg.EnableSavePrac },
+                    new CmdDef { Name = "Tip practice", Command = "/tipprac", Detail = "Pucks fly through your crease for you to redirect.", ServerEnabled = () => Cfg.EnableTipPrac },
+                    new CmdDef { Name = "Stop tip practice", Command = "/stoptipprac", Detail = "End the drill early.", ServerEnabled = () => Cfg.EnableTipPrac },
+                    new CmdDef { Name = "AI goalie", Command = "/dummy", Detail = "Spawn an AI goalie for your team.", ServerEnabled = () => Cfg.EnableDummy },
+                    new CmdDef { Name = "Vote for AI goalies", Command = "/votegoalies", Detail = "Majority vote to fill empty goalie slots for the rest of the session.", ServerEnabled = () => Cfg.EnableGoalieVoting },
+                }
+            },
+            new CmdGroup
+            {
+                Title = "Practice sheets",
+                Subtitle = "Extra copies of the rink, built when someone asks for one and taken down once they're empty.",
+                Items = new[]
+                {
+                    new CmdDef { Name = "Rink list", Command = "/rinks", Detail = "Show every practice rink and who's on it.", ServerEnabled = () => Cfg.EnableRinkSheets },
+                    new CmdDef { Name = "New rink", Command = "/rink new", Detail = "Move to an empty practice rink. If there isn't one yet, the server builds it.", ServerEnabled = () => Cfg.EnableRinkSheets },
+                    new CmdDef { Name = "Join rink 2", Command = "/rink 2", Detail = "Join a specific rink by number. Rink 1 is the arena's own.", ServerEnabled = () => Cfg.EnableRinkSheets && Cfg.MaxRinkSheets >= 2 },
+                    new CmdDef { Name = "Join rink 3", Command = "/rink 3", Detail = "Join the third sheet. The server builds it on demand like the rest.", ServerEnabled = () => Cfg.EnableRinkSheets && Cfg.MaxRinkSheets >= 3 },
+                    new CmdDef { Name = "Back to main", Command = "/mainrink", Detail = "Return to the arena rink.", ServerEnabled = () => Cfg.EnableRinkSheets },
+                },
+                Footnote = "Dalf worked the rink cloning out first in Puck-MultiSheet, and we learned it " +
+                           "from his code. Thanks, Dalf: github.com/Dalfan4Puck/Puck-MultiSheet",
+            },
+            new CmdGroup
+            {
+                Title = "Traffic",
+                Subtitle = "Record a skating line, then replay it as an AI skater to work around.",
+                Items = new[]
+                {
+                    new CmdDef { Name = "Record traffic", Command = "/recordtraffic", Detail = "Start recording your movement.", ServerEnabled = () => Cfg.EnableTraffic },
+                    new CmdDef { Name = "Stop recording", Command = "/stoprecord", Detail = "Save what you just skated.", ServerEnabled = () => Cfg.EnableTraffic },
+                    new CmdDef { Name = "Spawn traffic", Command = "/traffic", Detail = "Spawn an AI skater. It plays back your recording if you have one.", ServerEnabled = () => Cfg.EnableTraffic },
+                    new CmdDef { Name = "Clear traffic", Command = "/cleartraffic", Detail = "Remove all of your traffic.", ServerEnabled = () => Cfg.EnableTraffic },
+                }
+            },
+            new CmdGroup
+            {
+                Title = "Stick taps",
+                Subtitle = "Tap your stick on the ice three times to fire these. Handy when you can't reach the keyboard.",
+                Items = new[]
+                {
+                    new CmdDef { Name = "Tap to pass", Command = "/tappass", Detail = "Pass from your saved pass position.", ServerEnabled = () => Cfg.EnableTapCommands },
+                    new CmdDef { Name = "Tap to spawn", Command = "/tapspawn", Detail = "Spawn a puck above your stick.", ServerEnabled = () => Cfg.EnableTapCommands },
+                    new CmdDef { Name = "Tap to yoyo", Command = "/tapyoyo", Detail = "Yoyo-return the last puck you shot.", ServerEnabled = () => Cfg.EnableTapCommands },
+                    new CmdDef { Name = "Tap to backpass", Command = "/tapbackpass", Detail = "Backpass to yourself.", ServerEnabled = () => Cfg.EnableTapCommands },
+                }
+            },
+            new CmdGroup
+            {
+                Title = "Utilities",
+                Items = new[]
+                {
+                    new CmdDef { Name = "Yoyo", Command = "/yoyo", Detail = "After shooting, yank your stick back to magnetically return the puck.", ServerEnabled = () => Cfg.EnableYoyo },
+                    new CmdDef { Name = "Infinite stamina", Command = "/infinitestamina", Detail = "Toggle infinite stamina for yourself.", ServerEnabled = () => Cfg.EnableInfiniteStamina },
+                    new CmdDef { Name = "Clear pucks", Command = "/clearpucks", Detail = "Clear loose pucks but keep one near each player." },
+                    new CmdDef { Name = "Clear everything", Command = "/clearall", Detail = "Pucks, cones, traffic, AI goalies. All of it." },
+                    new CmdDef { Name = "Print commands", Command = "/practice", Detail = "Dump the full command list into chat." },
+                }
+            },
+        };
+
+        // ------------------------------------------------------------------
+        // State
+        // ------------------------------------------------------------------
+
+        private enum UiTab { Actions, Commands, Server }
+
         private UITK.UIDocument _doc;
         private UITK.VisualElement _panel;
         private UITK.VisualElement _backdrop;
-        private UITK.VisualElement _commandsSectionVE;
-        private UITK.VisualElement _helpSectionVE;
-        private UITK.ScrollView _commandsScroll;
+        private UITK.ScrollView _actionsBody;
+        private UITK.ScrollView _commandsBody;
+        private UITK.ScrollView _serverBody;
+        private UITK.Button _tabActions;
         private UITK.Button _tabCommands;
-        private UITK.Button _tabHelp;
         private UITK.Button _tabServer;
-        private UITK.VisualElement _serverSectionVE;
         private UITK.VisualElement _captureOverlay;
         private UITK.Label _captureLabel;
 
+        private UiTab _activeTab = UiTab.Actions;
+
+        /// <summary>An Actions-tab button and the label showing its current bind.</summary>
+        private sealed class ActionTile
+        {
+            public string Command;
+            public UITK.Button Button;
+            public UITK.Label Chord;
+        }
+
+        private readonly List<ActionTile> _actionTiles = new List<ActionTile>();
         private bool _isVisible;
+
+        /// <summary>
+        /// True while the panel is up and therefore owns the keyboard.
+        ///
+        /// Static because the thing that needs to read it is a Harmony prefix on
+        /// UIManager's chat-open input callbacks (see <see cref="MenuInputBlock"/>),
+        /// which has no route to this instance. Kept in lockstep with
+        /// <c>_isVisible</c> by <see cref="ShowUI"/> / <see cref="HideUI"/>, and
+        /// force-cleared in <see cref="OnDestroy"/> so a mod reload can't strand the
+        /// game with chat permanently blocked.
+        /// </summary>
+        internal static bool MenuOwnsKeyboard { get; private set; }
+
         private bool _savedCursorState;
         private CursorLockMode _prevLockState = CursorLockMode.None;
         private bool _prevCursorVisible;
+        private bool _savedMouseRequired;
+        private bool _prevIsMouseRequired;
 
         private bool _isCapturing;
         private UITK.Button _captureButton;
@@ -39,157 +229,38 @@ namespace MaxPractice
         private int _captureBestWeight;
         private MaxPracticeKeybindManager.KeyChord _captureBestChord;
 
-        private enum UiTab { Commands, Help, Server }
-        private UiTab _activeTab = UiTab.Commands;
-
-        private class CmdRow
-        {
-            public UITK.DropdownField Dropdown;
-            public string Chord;
-            public UITK.VisualElement Chips;
-            public UITK.VisualElement Row;
-        }
-
-        private readonly List<CmdRow> _cmdRows = new List<CmdRow>();
-
-        private static readonly Dictionary<string, string> LABEL_TO_COMMAND = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            { "SPAWNPUCK", "/s" },
-            { "BACKPASS", "/backpass" },
-            { "PASS", "/pass" },
-            { "YOYO", "/yoyo" },
-            { "POP", "/pop" },
-            { "CONES", "/cones" },
-            { "MINEFIELD", "/minefield" },
-            { "TRAFFIC", "/traffic" },
-            { "INFINITESTAMINA", "/infinitestamina" },
-            { "RECORDTRAFFIC", "/recordtraffic" },
-        };
-
-        private static readonly Dictionary<string, string> COMMAND_TO_LABEL = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            { "/spawnpuck", "SPAWNPUCK" },
-            { "/s", "SPAWNPUCK" },
-            { "/backpass", "BACKPASS" },
-            { "/pass", "PASS" },
-            { "/yoyo", "YOYO" },
-            { "/pop", "POP" },
-            { "/cones", "CONES" },
-            { "/minefield", "MINEFIELD" },
-            { "/traffic", "TRAFFIC" },
-            { "/infinitestamina", "INFINITESTAMINA" },
-            { "/recordtraffic", "RECORDTRAFFIC" },
-        };
-
-        private static readonly List<string> ALL_COMMAND_LABELS = new List<string>
-        {
-            "SPAWNPUCK", "BACKPASS", "PASS",
-            "YOYO", "POP",
-            "CONES", "MINEFIELD", "TRAFFIC",
-            "INFINITESTAMINA", "RECORDTRAFFIC",
-        };
-
-        private static readonly Color32 TextFieldBg = new Color32(57, 57, 57, 255);
-        private static readonly Color32 RowBg = new Color32(61, 61, 61, 255);
-        private static readonly Color32 ButtonBg = new Color32(57, 57, 57, 255);
-        private static readonly Color32 PanelBg = new Color32(48, 48, 47, 255);
-        private static readonly Color32 TabActiveBg = new Color32(80, 80, 80, 255);
-        private static readonly Color32 TabInactiveBg = new Color32(66, 66, 66, 255);
-        private static readonly Color32 ChipBg = new Color32(80, 80, 80, 255);
-        private static readonly Color32 ChipXBg = new Color32(100, 100, 100, 255);
-        private static readonly Color BtnBrightGray = (Color)RowBg;
-
-        private const float BTN_H = 36f;
-        private const float BTN_W = 120f;
-        private const float BTN_W_RM = 150f;
-        private const float GAP = 8f;
+        // Bind chip strips, keyed by command, so a rebind only redraws its own row.
+        private readonly Dictionary<string, UITK.VisualElement> _bindStrips =
+            new Dictionary<string, UITK.VisualElement>(StringComparer.OrdinalIgnoreCase);
 
         private static Font _uiFont;
 
-        private static Font GetUIFont()
-        {
-            if (_uiFont != null) return _uiFont;
-            try
-            {
-                var uiManager = MonoBehaviourSingleton<UIManager>.Instance;
-                if (uiManager != null && uiManager.PanelSettings != null)
-                {
-                    var textSettings = uiManager.PanelSettings.textSettings;
-                    if (textSettings != null && textSettings.defaultFontAsset != null)
-                    {
-                        _uiFont = textSettings.defaultFontAsset.sourceFontFile;
-                        if (_uiFont != null) return _uiFont;
-                    }
-                }
-            }
-            catch { }
-
-            try { _uiFont = Resources.GetBuiltinResource<Font>("Arial.ttf"); } catch { }
-            if (_uiFont == null)
-            {
-                try
-                {
-                    _uiFont = Font.CreateDynamicFontFromOSFont(
-                        new[] { "Arial", "Helvetica Neue", "Segoe UI", "Liberation Sans", "Noto Sans" }, 16);
-                }
-                catch { }
-            }
-            return _uiFont;
-        }
-
-        private static void ForceUIFont(UITK.VisualElement ve)
-        {
-            var f = GetUIFont();
-            if (f == null) return;
-            ve.style.unityFont = f;
-        }
-
-        private static void MakeReadable(UITK.Label l)
-        {
-            l.style.color = Color.white;
-            l.style.unityFont = GetUIFont();
-        }
-
-        private static void MakeReadable(UITK.Button b)
-        {
-            b.style.color = Color.white;
-            b.style.unityFont = GetUIFont();
-        }
-
-        private static void MakeReadable(UITK.TextField tf)
-        {
-            tf.style.color = Color.white;
-            tf.style.unityFont = GetUIFont();
-            tf.style.backgroundColor = new UITK.StyleColor(TextFieldBg);
-
-            var input = tf.childCount > 0 ? tf.ElementAt(0) : null;
-            if (input != null)
-            {
-                input.style.color = Color.white;
-                input.style.unityFont = GetUIFont();
-                input.style.backgroundColor = new UITK.StyleColor(TextFieldBg);
-            }
-        }
+        // ------------------------------------------------------------------
+        // Lifecycle
+        // ------------------------------------------------------------------
 
         private void Start()
         {
-            MaxPracticeKeybindManager.Initialize();
-            try
-            {
-                PonceMods.Shared.ModMenuHub.RegisterMod("MaxPractice", "MAX PRACTICE", ToggleUI, 40);
-                PonceMods.Shared.ModMenuHub.Initialize("MaxPractice");
-            }
-            catch (Exception e)
-            {
-                Debug.LogError("[MaxPractice] ModMenuHub registration failed: " + e);
-            }
+            try { MaxPracticeKeybindManager.Initialize(); }
+            catch (Exception e) { Debug.LogError("[MaxPractice] Keybind init failed: " + e); }
         }
 
         private void OnDestroy()
         {
-            try { PonceMods.Shared.ModMenuHub.UnregisterMod("MaxPractice"); } catch { }
-            _panel?.RemoveFromHierarchy();
-            _backdrop?.RemoveFromHierarchy();
+            // Unconditionally, and first: this runs on mod disable and on session end, and
+            // a stuck `true` here would leave the player unable to open chat at all with no
+            // panel on screen to explain why.
+            MenuOwnsKeyboard = false;
+
+            // Same deal as HideUI: once the game has recomputed, replaying the lock state we
+            // captured at ShowUI would undo it. That matters most here - being destroyed
+            // usually means the mod was disabled or the session ended, i.e. exactly when the
+            // requirement has changed since we opened.
+            if (RestorePlayerInput()) _savedCursorState = false;
+            else RestoreCursor();
+
+            if (_backdrop != null) _backdrop.RemoveFromHierarchy();
+            if (_panel != null) _panel.RemoveFromHierarchy();
         }
 
         public void ToggleUI()
@@ -206,44 +277,135 @@ namespace MaxPractice
             _prevLockState = UnityEngine.Cursor.lockState;
             _prevCursorVisible = UnityEngine.Cursor.visible;
             _savedCursorState = true;
-
             UnityEngine.Cursor.lockState = CursorLockMode.None;
             UnityEngine.Cursor.visible = true;
 
-            _backdrop.style.display = DisplayStyle.Flex;
-            _panel.style.display = DisplayStyle.Flex;
-            _isVisible = true;
+            SuppressPlayerInput();
 
-            LoadRowsFromConfig();
+            // Rebuild on open: the config can be reloaded between visits, and the
+            // enabled/disabled state is baked into the rows and tiles.
+            BuildActionsBody();
+            BuildCommandsBody();
+            BuildServerBody();
+            RefreshBinds();
+
+            _backdrop.style.display = UITK.DisplayStyle.Flex;
+            _panel.style.display = UITK.DisplayStyle.Flex;
+            _backdrop.BringToFront();
+            _panel.BringToFront();
+            _isVisible = true;
+            MenuOwnsKeyboard = true;
+
+            // Chat may already have been open when F3 was pressed. Blocking the open
+            // action from here on isn't enough on its own - the text field would keep
+            // focus and eat every keystroke aimed at the panel.
+            CloseGameChat();
         }
 
         private void HideUI()
         {
             if (_panel == null) return;
-            bool wasVisible = _isVisible;
-
             if (_isCapturing) CancelCapture();
 
-            _backdrop.style.display = DisplayStyle.None;
-            _panel.style.display = DisplayStyle.None;
+            _backdrop.style.display = UITK.DisplayStyle.None;
+            _panel.style.display = UITK.DisplayStyle.None;
             _isVisible = false;
+            MenuOwnsKeyboard = false;
 
-            if (!wasVisible) return;
-            try { PonceMods.Shared.ModMenuHub.OpenPanel(); }
-            catch { RestoreCursor(); }
+            // When the game recomputed the requirement it also drives the cursor through
+            // ApplicationManager.Event_OnUIStateChanged, so replaying our captured lock
+            // state on top would re-hide the cursor over whatever it just opened.
+            bool gameOwnsCursor = RestorePlayerInput();
+            if (gameOwnsCursor) _savedCursorState = false;
+            else RestoreCursor();
         }
 
-        private void FullCloseUI()
+        /// <summary>
+        /// Tell the game a menu wants the mouse, so skating input stops while the
+        /// panel is up. Without it you steer the player through the menu.
+        /// </summary>
+        private void SuppressPlayerInput()
         {
-            if (_panel == null) return;
-            if (_isCapturing) CancelCapture();
+            try
+            {
+                _prevIsMouseRequired = GlobalStateManager.UIState.IsMouseRequired;
+                _savedMouseRequired = true;
+                if (!_prevIsMouseRequired)
+                    GlobalStateManager.SetUIState(new Dictionary<string, object> { { "isMouseRequired", true } });
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[MaxPractice] SuppressPlayerInput failed: " + e.Message);
+            }
+        }
 
-            _backdrop.style.display = DisplayStyle.None;
-            _panel.style.display = DisplayStyle.None;
-            _isVisible = false;
+        /// <summary>
+        /// Hand the mouse back — by asking the game to recompute it, not by replaying the
+        /// value we captured on open.
+        ///
+        /// Esc reaches both of us. The Input System dispatches PauseAction (and so
+        /// UIManager.OnPauseActionPerformed -> PauseMenu.Show() -> CheckMouseRequirement,
+        /// which sets isMouseRequired = true) in the input update that runs BEFORE
+        /// MonoBehaviour.Update - that is the same reason escapeKey.wasPressedThisFrame is
+        /// true for us at all. Writing our remembered false back over that left the pause
+        /// menu up with a hidden, locked cursor and input routed to the skater, so you had
+        /// to blind-press Esc a second time.
+        ///
+        /// Recomputing is also order-independent: if the game shows the pause menu after
+        /// us instead, its own visibility change recomputes again and still wins.
+        /// </summary>
+        /// <returns>true when the game recomputed and now owns the mouse/cursor state.</returns>
+        private bool RestorePlayerInput()
+        {
+            if (!_savedMouseRequired) return false;
+            _savedMouseRequired = false;
+            try
+            {
+                if (TryGameRecomputeMouseRequirement()) return true;
+                GlobalStateManager.SetUIState(new Dictionary<string, object> { { "isMouseRequired", _prevIsMouseRequired } });
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[MaxPractice] RestorePlayerInput failed: " + e.Message);
+            }
+            return false;
+        }
 
-            try { PonceMods.Shared.ModMenuHub.FullClose(); }
-            catch { RestoreCursor(); }
+        private static System.Reflection.MethodInfo _checkMouseRequirement;
+        private static bool _checkMouseRequirementResolved;
+
+        /// <summary>
+        /// Invoke the game's own mouse-requirement recompute. Private on UIManager, hence
+        /// the reflection; returns false if the game ever drops it, so the caller can fall
+        /// back to the remembered value.
+        /// </summary>
+        private static bool TryGameRecomputeMouseRequirement()
+        {
+            if (!_checkMouseRequirementResolved)
+            {
+                _checkMouseRequirementResolved = true;
+                try
+                {
+                    _checkMouseRequirement = typeof(UIManager).GetMethod(
+                        "CheckMouseRequirement",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.NonPublic,
+                        null, Type.EmptyTypes, null);
+                }
+                catch { _checkMouseRequirement = null; }
+
+                if (_checkMouseRequirement == null)
+                    Debug.LogWarning("[MaxPractice] UIManager.CheckMouseRequirement not found; " +
+                                     "falling back to restoring the captured mouse state.");
+            }
+
+            if (_checkMouseRequirement == null) return false;
+
+            var mgr = MonoBehaviourSingleton<UIManager>.Instance;
+            if (mgr == null) return false;
+
+            _checkMouseRequirement.Invoke(mgr, null);
+            return true;
         }
 
         private void RestoreCursor()
@@ -257,7 +419,16 @@ namespace MaxPractice
         private void Update()
         {
             if (!_isVisible && !_isCapturing)
+            {
                 ProcessKeybindInputs();
+
+                var hk = Keyboard.current;
+                if (hk != null && !IsChatOpen() && hk.f3Key.wasPressedThisFrame)
+                {
+                    ShowUI();
+                    return;
+                }
+            }
 
             if (!_isVisible) return;
 
@@ -279,7 +450,7 @@ namespace MaxPractice
                         _captureStarted = true;
                         _captureWindowEnd = Time.unscaledTime + 1.0f;
                         if (_captureLabel != null)
-                            _captureLabel.text = "Release keys/buttons to confirm binding...";
+                            _captureLabel.text = "Release to confirm";
                     }
                 }
                 else
@@ -295,8 +466,22 @@ namespace MaxPractice
                             _captureBestWeight = w;
                             _captureLastBestAt = Time.unscaledTime;
                             if (_captureLabel != null)
-                                _captureLabel.text = MaxPracticeKeybindManager.ChordToString(chord) + " - release to confirm";
+                                _captureLabel.text = MaxPracticeKeybindManager.ChordToString(chord) + "  ·  release to confirm";
                         }
+                    }
+
+                    // The capture arms on ANY input, but only keys that pass IsAllowedKey can
+                    // form a chord - so starting it with an unbindable key left _captureBestWeight
+                    // at -1, which the exit test below requires to be >= 0. The capture then sat
+                    // there re-snapshotting every frame, showing "Release to confirm" while
+                    // nothing could ever confirm it, until the player found Escape. Re-arm when
+                    // the window closes with nothing usable, and say why.
+                    if (_captureBestWeight < 0 && Time.unscaledTime >= _captureWindowEnd)
+                    {
+                        _captureStarted = false;
+                        if (_captureLabel != null)
+                            _captureLabel.text = "That key can't be bound. Try another, or Esc to cancel.";
+                        return;
                     }
 
                     bool allReleased = !HasAnyInputDown();
@@ -308,11 +493,11 @@ namespace MaxPractice
                     }
                 }
             }
-            else
+            else if (kb != null)
             {
-                if (kb.escapeKey.wasPressedThisFrame)
+                if (kb.escapeKey.wasPressedThisFrame || kb.f3Key.wasPressedThisFrame)
                 {
-                    FullCloseUI();
+                    HideUI();
                     return;
                 }
             }
@@ -322,6 +507,10 @@ namespace MaxPractice
             if (!UnityEngine.Cursor.visible)
                 UnityEngine.Cursor.visible = true;
         }
+
+        // ------------------------------------------------------------------
+        // Panel construction
+        // ------------------------------------------------------------------
 
         private void CreateUI()
         {
@@ -333,349 +522,422 @@ namespace MaxPractice
                 if (root == null) return;
 
                 _backdrop = new UITK.VisualElement { name = "MaxPractice_Backdrop" };
-                _backdrop.style.position = Position.Absolute;
+                _backdrop.style.position = UITK.Position.Absolute;
                 _backdrop.style.left = 0;
                 _backdrop.style.top = 0;
                 _backdrop.style.right = 0;
                 _backdrop.style.bottom = 0;
-                _backdrop.style.backgroundColor = new UITK.StyleColor(new Color(0, 0, 0, 0f));
+                _backdrop.style.backgroundColor = new UITK.StyleColor(Backdrop);
                 _backdrop.style.display = UITK.DisplayStyle.None;
                 _backdrop.pickingMode = UITK.PickingMode.Position;
                 _backdrop.RegisterCallback<UITK.PointerUpEvent>(_ => HideUI());
+                root.Add(_backdrop);
 
                 _panel = new UITK.VisualElement { name = "MaxPractice_Panel" };
-                _panel.style.position = UITK.Position.Absolute;
-                _panel.style.left = new UITK.Length(50, UITK.LengthUnit.Percent);
-                _panel.style.top = new UITK.Length(50, UITK.LengthUnit.Percent);
-                _panel.style.translate = new UITK.Translate(
+                var ps = _panel.style;
+                ps.position = UITK.Position.Absolute;
+                ps.left = new UITK.Length(50, UITK.LengthUnit.Percent);
+                ps.top = new UITK.Length(50, UITK.LengthUnit.Percent);
+                ps.translate = new UITK.Translate(
                     new UITK.Length(-50, UITK.LengthUnit.Percent),
                     new UITK.Length(-50, UITK.LengthUnit.Percent), 0f);
-                int targetW = Mathf.Clamp(Mathf.RoundToInt(Screen.width * 0.58f), 680, 980);
-                _panel.style.width = targetW;
-                _panel.style.height = new UITK.Length(84, UITK.LengthUnit.Percent);
-                _panel.style.minHeight = new UITK.Length(56, UITK.LengthUnit.Percent);
-                _panel.style.maxHeight = new UITK.Length(56, UITK.LengthUnit.Percent);
-                _panel.style.overflow = UITK.Overflow.Hidden;
-                _panel.style.flexDirection = UITK.FlexDirection.Column;
-                _panel.style.backgroundColor = new UITK.StyleColor(PanelBg);
-                _panel.style.paddingLeft = 8;
-                _panel.style.paddingRight = 8;
-                _panel.style.paddingTop = 8;
-                _panel.style.paddingBottom = 8;
-                _panel.style.display = UITK.DisplayStyle.None;
+                ps.width = Mathf.Clamp(Mathf.RoundToInt(Screen.width * 0.58f), 720, 1040);
+                ps.height = new UITK.Length(84, UITK.LengthUnit.Percent);
+                ps.minHeight = new UITK.Length(60, UITK.LengthUnit.Percent);
+                ps.maxHeight = new UITK.Length(78, UITK.LengthUnit.Percent);
+                ps.overflow = UITK.Overflow.Hidden;
+                ps.flexDirection = UITK.FlexDirection.Column;
+                ps.backgroundColor = new UITK.StyleColor(PanelBg);
+                ps.paddingLeft = 18;
+                ps.paddingRight = 18;
+                ps.paddingTop = 16;
+                ps.paddingBottom = 14;
+                SetRadius(_panel, 12f);
+                SetBorderWidth(_panel, 1f);
+                SetBorderColor(_panel, PanelBorder);
+                ps.display = UITK.DisplayStyle.None;
+                // Clicks inside the panel must not reach the backdrop's close handler.
                 _panel.RegisterCallback<UITK.PointerUpEvent>(e => e.StopPropagation());
+                root.Add(_panel);
 
-                var bigTitle = new UITK.Label("MAX PRACTICE");
-                bigTitle.style.unityFontStyleAndWeight = FontStyle.Normal;
-                bigTitle.style.fontSize = 50;
-                bigTitle.style.color = Color.white;
-                bigTitle.style.marginBottom = 16;
-                _panel.Add(bigTitle);
+                var titleRow = new UITK.VisualElement();
+                titleRow.style.flexDirection = UITK.FlexDirection.Row;
+                titleRow.style.alignItems = UITK.Align.Center;
+                titleRow.style.marginBottom = 4;
+                titleRow.Add(Title("MAX", TextPrimary));
+                titleRow.Add(Title(" PRACTICE", Accent));
+                _panel.Add(titleRow);
+
+                var subtitle = new UITK.Label("Practice tools  ·  F3 to toggle  ·  Esc to close");
+                subtitle.style.fontSize = 12;
+                subtitle.style.color = new UITK.StyleColor(TextMuted);
+                subtitle.style.marginBottom = 12;
+                ForceUIFont(subtitle);
+                _panel.Add(subtitle);
 
                 var tabBar = new UITK.VisualElement();
                 tabBar.style.flexDirection = UITK.FlexDirection.Row;
-                tabBar.style.marginBottom = 8;
-                tabBar.style.height = 50;
                 _panel.Add(tabBar);
-                ForceUIFont(_panel);
 
-                _tabCommands = MakeTab("COMMANDS", () => ShowTab(UiTab.Commands));
-                _tabHelp = MakeTab("HELP", () => ShowTab(UiTab.Help));
-                tabBar.Add(_tabCommands);
-                tabBar.Add(_tabHelp);
-                AddTabHover(_tabCommands, () => _activeTab == UiTab.Commands);
-                AddTabHover(_tabHelp, () => _activeTab == UiTab.Help);
-                _tabServer = MakeTab("SERVER", () => ShowTab(UiTab.Server));
-                // Last tab keeps no right margin so SERVER sits flush with the
-                // right edge the same way COMMANDS hugs the left.
+                _tabActions = MakeTab("Actions", () => ShowTab(UiTab.Actions), () => _activeTab == UiTab.Actions);
+                _tabCommands = MakeTab("Binds", () => ShowTab(UiTab.Commands), () => _activeTab == UiTab.Commands);
+                _tabServer = MakeTab("Server", () => ShowTab(UiTab.Server), () => _activeTab == UiTab.Server);
                 _tabServer.style.marginRight = 0;
+                tabBar.Add(_tabActions);
+                tabBar.Add(_tabCommands);
                 tabBar.Add(_tabServer);
-                AddTabHover(_tabServer, () => _activeTab == UiTab.Server);
 
-                var scroll = new UITK.ScrollView
-                {
-                    verticalScrollerVisibility = UITK.ScrollerVisibility.Auto,
-                    horizontalScrollerVisibility = UITK.ScrollerVisibility.Hidden
-                };
-                scroll.style.flexGrow = 1;
-                // A flex item's default min-height is its content size, so a
-                // long list would keep the scroll view tall and push the footer
-                // past the panel's clipped bottom; pin min-height to 0 so the
-                // list shrinks and the footer stays in.
-                scroll.style.flexShrink = 1;
-                scroll.style.minHeight = 0;
-                _panel.Add(scroll);
+                _actionsBody = MakeBody();
+                _commandsBody = MakeBody();
+                _serverBody = MakeBody();
+                _panel.Add(_actionsBody);
+                _panel.Add(_commandsBody);
+                _panel.Add(_serverBody);
 
-                _commandsSectionVE = new UITK.VisualElement();
-                _helpSectionVE = new UITK.VisualElement();
-                _serverSectionVE = new UITK.VisualElement();
-                scroll.Add(_commandsSectionVE);
-                scroll.Add(_helpSectionVE);
-                scroll.Add(_serverSectionVE);
-                BuildCommandsSection();
-                BuildHelpSection();
-                BuildServerSection();
+                // The three bodies are deliberately left empty here. CreateUI has exactly one
+                // caller - ShowUI, immediately before it fills them itself so the rows pick up
+                // any config reloaded since the last visit - so building them here only ever
+                // produced a full set of rows, tiles and bind chips that were thrown away
+                // microseconds later on the very first F3 press.
 
                 var footer = new UITK.VisualElement();
                 footer.style.flexDirection = UITK.FlexDirection.Row;
-                footer.style.justifyContent = UITK.Justify.SpaceBetween;
-                footer.style.marginTop = 8;
-                footer.style.flexShrink = 0;   // footer keeps its size; the list shrinks instead
-
-                var coffee = MakeFooterButton("COFFEE?", () => Application.OpenURL("https://buymeacoffee.com/amikiir"));
-                var rightButtons = new UITK.VisualElement();
-                rightButtons.style.flexDirection = UITK.FlexDirection.Row;
-
-                var reset = MakeFooterButton("RESET TO DEFAULT", () =>
-                {
-                    ResetDefaults();
-                    LoadRowsFromConfig();
-                });
-                reset.style.marginLeft = 8;
-
-                var close = MakeFooterButton("CLOSE", () =>
-                {
-                    if (TryApplyFromPanel())
-                        MaxPracticeKeybindManager.SaveConfig();
-                    HideUI();
-                });
-                close.style.marginLeft = 8;
-                close.style.paddingRight = 182;
-
-                rightButtons.Add(reset);
-                rightButtons.Add(close);
-
-                footer.Add(coffee);
-                footer.Add(rightButtons);
+                footer.style.justifyContent = UITK.Justify.FlexEnd;
+                footer.style.marginTop = 12;
                 _panel.Add(footer);
 
-                ShowTab(UiTab.Commands);
+                footer.Add(MakeFooterButton("Clear all binds", () =>
+                {
+                    if (_isCapturing) CancelCapture();
+                    MaxPracticeKeybindManager.Config.commandBinds.Clear();
+                    MaxPracticeKeybindManager.SaveConfig();
+                    RefreshBinds();
+                }));
+                footer.Add(MakeFooterButton("Close", HideUI));
 
-                root.Add(_backdrop);
-                root.Add(_panel);
-
-                // Capture overlay (full-screen key rebind prompt)
-                _captureOverlay = new UITK.VisualElement { name = "MaxPractice_CaptureOverlay" };
-                _captureOverlay.style.position = UITK.Position.Absolute;
-                _captureOverlay.style.left = 0; _captureOverlay.style.right = 0;
-                _captureOverlay.style.top = 0; _captureOverlay.style.bottom = 0;
-                _captureOverlay.style.backgroundColor = new UITK.StyleColor(new Color(0.1f, 0.1f, 0.15f, 0.95f));
-                _captureOverlay.style.display = UITK.DisplayStyle.None;
-                _captureOverlay.pickingMode = UITK.PickingMode.Position;
-                _captureOverlay.RegisterCallback<UITK.PointerUpEvent>(e => e.StopPropagation());
-                ForceUIFont(_captureOverlay);
-
-                var captureCenter = new UITK.VisualElement();
-                captureCenter.style.position = UITK.Position.Absolute;
-                captureCenter.style.left = new UITK.Length(50, UITK.LengthUnit.Percent);
-                captureCenter.style.top = new UITK.Length(50, UITK.LengthUnit.Percent);
-                captureCenter.style.translate = new UITK.Translate(
-                    new UITK.Length(-50, UITK.LengthUnit.Percent),
-                    new UITK.Length(-50, UITK.LengthUnit.Percent), 0f);
-                captureCenter.style.alignItems = UITK.Align.Center;
-                captureCenter.style.justifyContent = UITK.Justify.Center;
-                captureCenter.style.flexDirection = UITK.FlexDirection.Column;
-
-                var captureTitle = new UITK.Label("KEY REBIND");
-                captureTitle.style.fontSize = 72;
-                captureTitle.style.color = Color.white;
-                captureTitle.style.unityFontStyleAndWeight = FontStyle.Bold;
-                captureTitle.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
-                captureTitle.style.marginBottom = 32;
-                ForceUIFont(captureTitle);
-                captureCenter.Add(captureTitle);
-
-                _captureLabel = new UITK.Label("Press a key or combination of keys to rebind.");
-                _captureLabel.style.fontSize = 24;
-                _captureLabel.style.color = new Color(0.9f, 0.9f, 0.9f, 1f);
-                _captureLabel.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
-                _captureLabel.style.whiteSpace = UITK.WhiteSpace.Normal;
-                _captureLabel.style.maxWidth = 600;
-                ForceUIFont(_captureLabel);
-                captureCenter.Add(_captureLabel);
-
-                _captureOverlay.Add(captureCenter);
-                root.Add(_captureOverlay);
+                BuildCaptureOverlay();
+                ShowTab(_activeTab);
             }
             catch (Exception e)
             {
-                Debug.LogError("[MaxPractice] CreateUI failed: " + e);
+                Debug.LogError("[MaxPractice] Failed to build the menu: " + e);
             }
         }
 
-        private UITK.Button MakeTab(string text, Action onClick)
+        private void BuildCaptureOverlay()
         {
-            var b = new UITK.Button(onClick) { text = text.ToUpperInvariant() };
-            b.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
-            b.style.height = 50;
-            b.style.flexGrow = 1;
-            b.style.paddingLeft = 8;
-            b.style.paddingRight = 8;
-            b.style.marginRight = 8;
-            // Spacing below the tab strip is owned by tabBar.marginBottom; the
-            // button keeps no bottom margin of its own.
-            b.style.marginBottom = 0;
-            b.style.fontSize = 24;
-            b.style.borderTopLeftRadius = 6;
-            b.style.borderTopRightRadius = 6;
-            b.style.borderBottomLeftRadius = 0;
-            b.style.borderBottomRightRadius = 0;
-            b.style.borderBottomWidth = 0;
-            b.style.borderBottomColor = new UITK.StyleColor(Color.white);
-            b.style.backgroundColor = new UITK.StyleColor(TabInactiveBg);
-            b.style.color = new Color(0.7f, 0.7f, 0.7f);
-            ForceUIFont(b);
-            return b;
+            _captureOverlay = new UITK.VisualElement();
+            _captureOverlay.style.position = UITK.Position.Absolute;
+            _captureOverlay.style.left = 0;
+            _captureOverlay.style.top = 0;
+            _captureOverlay.style.right = 0;
+            _captureOverlay.style.bottom = 0;
+            _captureOverlay.style.backgroundColor = new UITK.StyleColor(new Color(0f, 0f, 0f, 0.82f));
+            _captureOverlay.style.alignItems = UITK.Align.Center;
+            _captureOverlay.style.justifyContent = UITK.Justify.Center;
+            _captureOverlay.style.display = UITK.DisplayStyle.None;
+            _captureOverlay.pickingMode = UITK.PickingMode.Position;
+
+            var heading = new UITK.Label("PRESS A KEY");
+            heading.style.fontSize = 28;
+            heading.style.color = new UITK.StyleColor(Accent);
+            heading.style.unityFontStyleAndWeight = FontStyle.Bold;
+            heading.style.letterSpacing = 3;
+            heading.style.marginBottom = 10;
+            ForceUIFont(heading);
+            _captureOverlay.Add(heading);
+
+            _captureLabel = new UITK.Label("Press a key, or a modifier plus a key.");
+            _captureLabel.style.fontSize = 14;
+            _captureLabel.style.color = new UITK.StyleColor(TextMuted);
+            ForceUIFont(_captureLabel);
+            _captureOverlay.Add(_captureLabel);
+
+            var hint = new UITK.Label("Esc to cancel");
+            hint.style.fontSize = 12;
+            hint.style.color = new UITK.StyleColor(TextDim);
+            hint.style.marginTop = 14;
+            ForceUIFont(hint);
+            _captureOverlay.Add(hint);
+
+            _panel.Add(_captureOverlay);
         }
 
-        // PlayerQoL footer buttons: no bottom margins of their own - the 8px
-        // gap under the row comes from the panel's bottom padding.
-        private UITK.Button MakeFooterButton(string text, Action onClick)
+        /// <summary>
+        /// The quick-launch grid: every command as a button you can just click.
+        /// Anything that can be bound to a key can be fired from here instead, so
+        /// the mod is fully usable without binding anything or typing in chat.
+        /// The panel stays open on a click so you can lay out a whole drill -
+        /// cones, then traffic, then a goalie - in one visit.
+        /// </summary>
+        private void BuildActionsBody()
         {
-            var b = new UITK.Button(onClick) { text = text.ToUpperInvariant() };
-            b.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
-            b.style.height = 50;
-            b.style.paddingLeft = 18;
-            b.style.paddingRight = 18;
-            b.style.backgroundColor = BtnBrightGray;
-            AddButtonFlash(b);
-            return b;
-        }
+            _actionsBody.Clear();
+            _actionTiles.Clear();
 
-        private void BuildCommandsSection()
-        {
-            _commandsSectionVE.Clear();
+            _actionsBody.Add(Note(
+                "Click to run. Each button shows its bind, or the command if there isn' + chr(39) + 't one; set binds " +
+                "on the Binds tab. The menu stays open, so you can lay a whole drill out in one go.", TextMuted));
 
-            var head = new UITK.Label("BIND COMMANDS");
-            MakeReadable(head);
-            head.style.unityFontStyleAndWeight = FontStyle.Normal;
-            head.style.fontSize = 30;
-            head.style.marginBottom = 10;
-            _commandsSectionVE.Add(head);
-
-            _commandsScroll = new UITK.ScrollView
+            foreach (var group in CATALOGUE)
             {
-                verticalScrollerVisibility = UITK.ScrollerVisibility.Auto,
-                horizontalScrollerVisibility = UITK.ScrollerVisibility.Hidden
-            };
-            _commandsScroll.style.flexGrow = 1;
-            _commandsSectionVE.Add(_commandsScroll);
+                var section = AddSection(_actionsBody, group.Title, group.Subtitle);
 
-            var addCmd = new UITK.Button(() => AddCommandRow("/s", "")) { text = "ADD NEW COMMAND ROW" };
-            addCmd.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
-            addCmd.style.height = 50;
-            addCmd.style.marginBottom = 22;
-            addCmd.style.paddingLeft = 8;
-            addCmd.style.paddingRight = 8;
-            addCmd.style.backgroundColor = BtnBrightGray;
-            AddButtonFlash(addCmd);
-            _commandsSectionVE.Add(addCmd);
-        }
+                var grid = new UITK.VisualElement();
+                grid.style.flexDirection = UITK.FlexDirection.Row;
+                grid.style.flexWrap = UITK.Wrap.Wrap;
+                grid.style.marginBottom = 8;
+                section.Add(grid);
 
-        private void LoadRowsFromConfig()
-        {
-            _cmdRows.Clear();
-            _commandsScroll?.Clear();
+                foreach (var def in group.Items)
+                    grid.Add(MakeActionTile(def));
 
-            MaxPracticeKeybindManager.LoadConfig();
-            foreach (var raw in MaxPracticeKeybindManager.Config.commandBinds)
-            {
-                int idx = raw.LastIndexOf(':');
-                if (idx < 1) continue;
-                var cmd = raw.Substring(0, idx).Trim();
-                var chord = raw.Substring(idx + 1).Trim();
-                AddCommandRow(cmd, chord);
+                if (!string.IsNullOrEmpty(group.Footnote))
+                    section.Add(SectionFootnote(group.Footnote));
             }
         }
 
-        private void AddCommandRow(string cmd, string chordSpec)
+        private UITK.VisualElement MakeActionTile(CmdDef def)
         {
-            var model = new CmdRow { Chord = chordSpec ?? "" };
+            bool enabled = true;
+            try { enabled = def.ServerEnabled == null || def.ServerEnabled(); }
+            catch { }
 
-            var row = new UITK.VisualElement();
-            row.style.flexDirection = UITK.FlexDirection.Row;
-            row.style.alignItems = UITK.Align.Center;
-            row.style.height = 50;
-            row.style.marginBottom = 8;
-            row.style.backgroundColor = new UITK.StyleColor(RowBg);
-            row.style.paddingLeft = 12;
-            row.style.paddingRight = 10;
-            row.style.paddingTop = 8;
-            row.style.paddingBottom = 8;
+            var button = new UITK.Button();
+            button.style.height = 52;
+            button.style.minWidth = 158;
+            button.style.flexGrow = 1;
+            button.style.flexBasis = 158;
+            button.style.marginLeft = 0;
+            button.style.marginTop = 0;
+            button.style.marginRight = 8;
+            button.style.marginBottom = 8;
+            button.style.paddingLeft = 12;
+            button.style.paddingRight = 12;
+            button.style.paddingTop = 6;
+            button.style.paddingBottom = 6;
+            button.style.backgroundColor = new UITK.StyleColor(RowBg);
+            button.style.alignItems = UITK.Align.FlexStart;
+            button.style.justifyContent = UITK.Justify.Center;
+            SetRadius(button, ROW_RADIUS);
+            SetBorderWidth(button, 1f);
+            SetBorderColor(button, SectionBorder);
+            button.focusable = false;
 
-            var left = new UITK.DropdownField();
-            left.choices = ALL_COMMAND_LABELS;
-            string normalizedCmd = string.IsNullOrWhiteSpace(cmd) ? "/spawnpuck" : (cmd.StartsWith("/") ? cmd : "/" + cmd.TrimStart('/'));
-            left.value = COMMAND_TO_LABEL.TryGetValue(normalizedCmd, out var label) ? label : "SPAWNPUCK";
-            StyleDropdown(left);
+            var name = new UITK.Label(def.Name);
+            name.style.fontSize = 14;
+            name.style.color = new UITK.StyleColor(enabled ? TextPrimary : TextDim);
+            name.style.unityFontStyleAndWeight = FontStyle.Bold;
+            name.style.whiteSpace = UITK.WhiteSpace.Normal;
+            ForceUIFont(name);
+            button.Add(name);
 
-            var arrow = new UITK.Label(" ▼");
-            arrow.style.position = Position.Absolute;
-            arrow.style.right = 8;
-            arrow.style.unityTextAlign = TextAnchor.MiddleRight;
-            left.Add(arrow);
+            var chord = new UITK.Label(string.Empty);
+            chord.style.fontSize = 11;
+            chord.style.color = new UITK.StyleColor(enabled ? Accent : TextDim);
+            chord.style.marginTop = 2;
+            ForceUIFont(chord);
+            button.Add(chord);
 
-            row.Add(left);
-
-            var remove = new UITK.Button(() =>
+            if (!enabled)
             {
-                row.RemoveFromHierarchy();
-                _cmdRows.Remove(model);
-            });
-            StyleRowButton(remove, BTN_W_RM, "REMOVE");
-            remove.style.backgroundColor = new UITK.StyleColor(ButtonBg);
-            row.Add(remove);
-
-            var chipsRoot = new UITK.VisualElement();
-            chipsRoot.style.flexDirection = UITK.FlexDirection.Row;
-            chipsRoot.style.justifyContent = UITK.Justify.FlexEnd;
-            chipsRoot.style.alignItems = UITK.Align.Center;
-            chipsRoot.style.flexGrow = 1;
-            chipsRoot.style.flexShrink = 1;
-            chipsRoot.style.minWidth = 0;
-            chipsRoot.style.marginLeft = 4;
-            chipsRoot.style.marginTop = 4;
-            chipsRoot.style.marginRight = 8;
-            row.Add(chipsRoot);
-            model.Chips = chipsRoot;
-
-            var right = new UITK.VisualElement();
-            right.style.flexDirection = UITK.FlexDirection.Row;
-            right.style.alignItems = UITK.Align.Center;
-            right.style.flexShrink = 0;
-            row.Add(right);
-
-            var bind = new UITK.Button();
-            bind.clicked += () =>
+                // The server has this switched off - the command would no-op, so
+                // don't pretend the button does anything.
+                chord.text = "disabled on this server";
+                chord.style.color = new UITK.StyleColor(TextDim);
+                button.style.backgroundColor = new UITK.StyleColor(SectionBg);
+                button.SetEnabled(false);
+            }
+            else
             {
-                StartCapture(bind, spec =>
+                button.clicked += () => TrySendChat(def.Command);
+                AddButtonFlash(button, RowBg);
+            }
+
+            _actionTiles.Add(new ActionTile { Command = def.Command, Button = button, Chord = chord });
+            return button;
+        }
+
+        /// <summary>Show each action's current bind on its tile.</summary>
+        private void RefreshActionChords()
+        {
+            foreach (var tile in _actionTiles)
+            {
+                if (tile == null || tile.Chord == null) continue;
+                if (!tile.Button.enabledSelf) continue;   // keeps the "disabled" note
+
+                var specs = new List<string>();
+                foreach (var raw in MaxPracticeKeybindManager.Config.commandBinds)
                 {
-                    model.Chord = spec;
-                    RefreshChips(model);
-                });
-            };
-            StyleRowButton(bind, BTN_W, "BIND");
-            bind.style.backgroundColor = new UITK.StyleColor(ButtonBg);
-            right.Add(bind);
+                    if (string.IsNullOrEmpty(raw)) continue;
+                    int colon = raw.LastIndexOf(':');
+                    if (colon < 1) continue;
+                    if (!string.Equals(raw.Substring(0, colon).Trim(), tile.Command, StringComparison.OrdinalIgnoreCase)) continue;
+                    specs.Add(raw.Substring(colon + 1).Trim());
+                }
 
-            model.Dropdown = left;
-            model.Row = row;
-            _cmdRows.Add(model);
-            _commandsScroll.Add(row);
-
-            RefreshChips(model);
+                if (specs.Count > 0)
+                {
+                    tile.Chord.text = string.Join("  /  ", specs.ToArray());
+                    tile.Chord.style.color = new UITK.StyleColor(Accent);
+                }
+                else
+                {
+                    tile.Chord.text = tile.Command;
+                    tile.Chord.style.color = new UITK.StyleColor(TextDim);
+                }
+            }
         }
 
-        private void RefreshChips(CmdRow model)
+        private void BuildCommandsBody()
         {
-            model.Chips.Clear();
-            if (string.IsNullOrWhiteSpace(model.Chord)) return;
+            _commandsBody.Clear();
+            _bindStrips.Clear();
 
-            model.Chips.Add(MakeChip(model.Chord, () =>
+            _commandsBody.Add(Note(
+                "Run a command from here, or give it a key and fire it without opening the menu. " +
+                "Most of these only work during warmup.", TextMuted));
+
+            foreach (var group in CATALOGUE)
             {
-                model.Chord = "";
-                RefreshChips(model);
-            }));
+                var section = AddSection(_commandsBody, group.Title, group.Subtitle);
+                foreach (var def in group.Items)
+                    section.Add(MakeCommandRow(def));
+
+                if (!string.IsNullOrEmpty(group.Footnote))
+                    section.Add(SectionFootnote(group.Footnote));
+            }
+        }
+
+        private UITK.VisualElement MakeCommandRow(CmdDef def)
+        {
+            var row = NewRow();
+
+            var text = new UITK.VisualElement();
+            text.style.flexGrow = 1;
+            text.style.flexShrink = 1;
+            text.style.marginRight = 10;
+            row.Add(text);
+
+            var nameRow = new UITK.VisualElement();
+            nameRow.style.flexDirection = UITK.FlexDirection.Row;
+            nameRow.style.alignItems = UITK.Align.Center;
+            text.Add(nameRow);
+
+            var name = new UITK.Label(def.Name);
+            name.style.fontSize = 15;
+            name.style.color = new UITK.StyleColor(TextPrimary);
+            name.style.unityFontStyleAndWeight = FontStyle.Bold;
+            ForceUIFont(name);
+            nameRow.Add(name);
+
+            var slash = new UITK.Label(def.Command);
+            slash.style.fontSize = 12;
+            slash.style.color = new UITK.StyleColor(AccentDim);
+            slash.style.marginLeft = 10;
+            ForceUIFont(slash);
+            nameRow.Add(slash);
+
+            // A server can switch most of these off; saying so beats a command that
+            // silently does nothing.
+            bool enabled = true;
+            try { enabled = def.ServerEnabled == null || def.ServerEnabled(); }
+            catch { }
+
+            if (!enabled)
+            {
+                var off = new UITK.Label("OFF");
+                off.style.fontSize = 10;
+                off.style.color = new UITK.StyleColor(TextDim);
+                off.style.unityFontStyleAndWeight = FontStyle.Bold;
+                off.style.letterSpacing = 1;
+                off.style.marginLeft = 10;
+                off.style.paddingLeft = 6;
+                off.style.paddingRight = 6;
+                off.style.paddingTop = 2;
+                off.style.paddingBottom = 2;
+                off.style.backgroundColor = new UITK.StyleColor(new Color(1f, 1f, 1f, 0.05f));
+                SetRadius(off, 3f);
+                ForceUIFont(off);
+                nameRow.Add(off);
+            }
+
+            if (!string.IsNullOrEmpty(def.Detail))
+            {
+                var detail = new UITK.Label(def.Detail);
+                detail.style.fontSize = 12;
+                detail.style.color = new UITK.StyleColor(enabled ? TextMuted : TextDim);
+                detail.style.whiteSpace = UITK.WhiteSpace.Normal;
+                detail.style.marginTop = 3;
+                ForceUIFont(detail);
+                text.Add(detail);
+            }
+
+            var strip = new UITK.VisualElement();
+            strip.style.flexDirection = UITK.FlexDirection.Row;
+            strip.style.alignItems = UITK.Align.Center;
+            strip.style.flexShrink = 0;
+            _bindStrips[def.Command] = strip;
+            row.Add(strip);
+
+            UITK.Button bind = null;
+            // The panel repaints this one to CaptureBg while it is listening for a key,
+            // so the hover handlers have to keep their hands off it until capture ends.
+            bind = MakeRowButton("Bind", 74f, ButtonBg, () => _captureButton == bind);
+            bind.clicked += () => StartCapture(bind, spec =>
+            {
+                if (string.IsNullOrEmpty(spec)) return;
+                string displaced = MaxPracticeKeybindManager.BindCommand(def.Command, spec);
+                RefreshBinds();
+                if (!string.IsNullOrEmpty(displaced))
+                    Debug.Log($"[MaxPractice] {spec} was bound to {displaced}; moved it to {def.Command}.");
+            });
+            row.Add(bind);
+
+            var run = MakeRowButton("Run", 74f, ButtonBg);
+            run.clicked += () => TrySendChat(def.Command);
+            run.style.marginLeft = 6;
+            if (!enabled) run.SetEnabled(false);
+            row.Add(run);
+
+            AddHover(row);
+            RefreshStrip(def.Command);
+            return row;
+        }
+
+        /// <summary>Redraw every row's bind chips and every action tile's bind label.</summary>
+        private void RefreshBinds()
+        {
+            foreach (var kvp in _bindStrips)
+                RefreshStrip(kvp.Key);
+
+            RefreshActionChords();
+        }
+
+        private void RefreshStrip(string command)
+        {
+            if (!_bindStrips.TryGetValue(command, out var strip) || strip == null) return;
+            strip.Clear();
+
+            var binds = MaxPracticeKeybindManager.Config.commandBinds;
+            for (int i = 0; i < binds.Count; i++)
+            {
+                string raw = binds[i];
+                if (string.IsNullOrEmpty(raw)) continue;
+
+                int colon = raw.LastIndexOf(':');
+                if (colon < 1) continue;
+                if (!string.Equals(raw.Substring(0, colon).Trim(), command, StringComparison.OrdinalIgnoreCase)) continue;
+
+                string spec = raw.Substring(colon + 1).Trim();
+                string entry = raw;
+                strip.Add(MakeChip(spec, () =>
+                {
+                    MaxPracticeKeybindManager.Config.commandBinds.Remove(entry);
+                    MaxPracticeKeybindManager.SaveConfig();
+                    RefreshBinds();
+                }));
+            }
         }
 
         private UITK.VisualElement MakeChip(string text, Action onRemove)
@@ -683,138 +945,553 @@ namespace MaxPractice
             var chip = new UITK.VisualElement();
             chip.style.flexDirection = UITK.FlexDirection.Row;
             chip.style.alignItems = UITK.Align.Center;
-            chip.style.backgroundColor = new UITK.StyleColor(ChipBg);
+            chip.style.backgroundColor = new UITK.StyleColor(ButtonBg);
             chip.style.paddingLeft = 8;
-            chip.style.paddingRight = 4;
-            chip.style.paddingTop = 4;
-            chip.style.paddingBottom = 4;
-            chip.style.marginRight = 4;
-            chip.style.borderTopLeftRadius = 4;
-            chip.style.borderTopRightRadius = 4;
-            chip.style.borderBottomLeftRadius = 4;
-            chip.style.borderBottomRightRadius = 4;
+            chip.style.paddingRight = 3;
+            chip.style.paddingTop = 3;
+            chip.style.paddingBottom = 3;
+            chip.style.marginRight = 6;
+            SetRadius(chip, 4f);
+            SetBorderWidth(chip, 1f);
+            SetBorderColor(chip, PanelBorder);
 
             var label = new UITK.Label(text);
-            label.style.fontSize = 14;
-            label.style.color = Color.white;
-            MakeReadable(label);
+            label.style.fontSize = 12;
+            label.style.color = new UITK.StyleColor(Accent);
+            label.style.unityFontStyleAndWeight = FontStyle.Bold;
+            ForceUIFont(label);
             chip.Add(label);
 
-            var xBtn = new UITK.Button(() => onRemove?.Invoke()) { text = "×" };
-            xBtn.style.width = 20;
-            xBtn.style.height = 20;
-            xBtn.style.marginLeft = 4;
-            xBtn.style.backgroundColor = new UITK.StyleColor(ChipXBg);
-            xBtn.style.fontSize = 14;
-            xBtn.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
-            xBtn.style.paddingLeft = 0;
-            xBtn.style.paddingRight = 0;
-            xBtn.style.paddingTop = 0;
-            xBtn.style.paddingBottom = 0;
-            xBtn.style.color = Color.white;
-            MakeReadable(xBtn);
-            AddChipButtonFlash(xBtn);
-            chip.Add(xBtn);
+            var x = new UITK.Button(onRemove) { text = "×" };
+            x.style.width = 18;
+            x.style.height = 18;
+            x.style.marginLeft = 6;
+            x.style.marginRight = 0;
+            x.style.marginTop = 0;
+            x.style.marginBottom = 0;
+            x.style.paddingLeft = 0;
+            x.style.paddingRight = 0;
+            x.style.paddingTop = 0;
+            x.style.paddingBottom = 0;
+            x.style.fontSize = 13;
+            x.style.color = new UITK.StyleColor(TextMuted);
+            x.style.backgroundColor = new UITK.StyleColor(Color.clear);
+            x.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
+            SetBorderWidth(x, 0f);
+            x.focusable = false;
+            ForceUIFont(x);
+            x.RegisterCallback<UITK.PointerEnterEvent>(_ => x.style.color = new UITK.StyleColor(Danger));
+            x.RegisterCallback<UITK.PointerLeaveEvent>(_ => x.style.color = new UITK.StyleColor(TextMuted));
+            chip.Add(x);
 
             return chip;
         }
 
-        private void BuildHelpSection()
+        // ------------------------------------------------------------------
+        // Server tab
+        // ------------------------------------------------------------------
+
+        private void BuildServerBody()
         {
-            _helpSectionVE.Clear();
+            if (_serverBody == null) return;
+            _serverBody.Clear();
 
-            var title = new UITK.Label("HELP");
-            MakeReadable(title);
-            title.style.unityFontStyleAndWeight = FontStyle.Normal;
-            title.style.fontSize = 30;
-            title.style.marginBottom = 10;
-            _helpSectionVE.Add(title);
+            var cfg = ConfigManager.Config;
+            if (cfg == null)
+            {
+                _serverBody.Add(Note("No config loaded.", TextMuted));
+                return;
+            }
 
-            AddHelpRow("/spawnpuck or /s", "Spawn a puck in front of you.");
-            AddHelpRow("/tapspawn", "Toggle tap spawn mode.");
-            AddHelpRow("/backpass or /bp", "Toggle backpass mode.");
-            AddHelpRow("/tapbackpass", "Toggle tap backpass mode.");
-            AddHelpRow("/clear", "Clear all spawned pucks and drills.");
-            AddHelpRow("/clearall", "Clear all spawned objects including traffic.");
-            AddHelpRow("/pass /unpass", "Toggle pass spawner.");
-            AddHelpRow("/tappass", "Toggle tap pass mode.");
-            AddHelpRow("/yoyo", "Toggle yoyo trainer.");
-            AddHelpRow("/tapyoyo", "Toggle tap yoyo mode.");
-            AddHelpRow("/pop", "Pop your last touched puck upward.");
-            AddHelpRow("/saveprac /stopsaveprac", "Toggle save practice drill.");
-            AddHelpRow("/tipprac /stoptipprac", "Toggle tip practice drill.");
-            AddHelpRow("/dummy /dummyred /dummyblue", "Toggle AI goalie commands.");
-            AddHelpRow("/cones and /minefield", "Spawn stickhandling drills.");
-            AddHelpRow("/traffic /cleartraffic", "Spawn or clear traffic skaters.");
-            AddHelpRow("/recordtraffic /stoprecord", "Record and stop traffic paths.");
-            AddHelpRow("/stamina or /is", "Toggle infinite stamina.");
+            _serverBody.Add(Note(
+                "What this MaxPractice install has switched on, read from config/maxpractice.json. " +
+                "On a listen server that is the live server config. If you joined someone else's " +
+                "server, this is only your own copy and the host's may differ.", TextMuted));
+
+            var commands = AddSection(_serverBody, "Commands");
+            commands.Add(MakeStateRow("Spawn puck", cfg.EnableSpawnPuck));
+            commands.Add(MakeStateRow("Backpass", cfg.EnableBackpass));
+            commands.Add(MakeStateRow("Pass", cfg.EnablePass));
+            commands.Add(MakeStateRow("Yoyo", cfg.EnableYoyo));
+            commands.Add(MakeStateRow("Pop", cfg.EnablePop));
+            commands.Add(MakeStateRow("Save practice", cfg.EnableSavePrac));
+            commands.Add(MakeStateRow("Tip practice", cfg.EnableTipPrac));
+            commands.Add(MakeStateRow("Cones", cfg.EnableCones));
+            commands.Add(MakeStateRow("Minefield", cfg.EnableMinefield));
+            commands.Add(MakeStateRow("Traffic", cfg.EnableTraffic));
+            commands.Add(MakeStateRow("AI goalie", cfg.EnableDummy));
+            commands.Add(MakeStateRow("Infinite stamina", cfg.EnableInfiniteStamina));
+            commands.Add(MakeStateRow("Stick taps", cfg.EnableTapCommands));
+            commands.Add(MakeStateRow("Practice sheets", cfg.EnableRinkSheets));
+
+            var limits = AddSection(_serverBody, "Limits");
+            limits.Add(MakeValueRow("Cone sets per player", cfg.ConesPerPlayer.ToString()));
+            limits.Add(MakeValueRow("Minefields per player", cfg.MinefieldPerPlayer.ToString()));
+            limits.Add(MakeValueRow("Traffic per player", cfg.TrafficPerPlayer.ToString()));
+            limits.Add(MakeValueRow("Save practice length", cfg.SavePracDurationSeconds + "s"));
+            limits.Add(MakeValueRow("Puck cleanup threshold", cfg.MaxPucksBeforeCleanup.ToString()));
+            limits.Add(MakeValueRow("Clear-command cooldown",
+                cfg.ClearCommandCooldownSeconds <= 0f ? "off" : cfg.ClearCommandCooldownSeconds + "s"));
+
+            var behaviour = AddSection(_serverBody, "Behaviour");
+            behaviour.Add(MakeStateRow("Cone visuals", cfg.ConeVisuals));
+            behaviour.Add(MakeStateRow("AI goalies persist through every phase", cfg.GoalieAIPersistDuringGame));
+            behaviour.Add(MakeStateRow("Vote for AI goalies", cfg.EnableGoalieVoting));
+            behaviour.Add(MakeStateRow("Warmup timer paused", cfg.PauseWarmupTimer));
+            behaviour.Add(MakeStateRow("Game-start voting blocked", cfg.DisableVoting));
+            behaviour.Add(MakeStateRow("AI hidden from the scoreboard", cfg.HideAIFromScoreboard));
+
+            if (cfg.EnableRinkSheets)
+            {
+                var sheets = AddSection(_serverBody, "Practice sheets");
+                sheets.Add(MakeValueRow("Rinks (including the arena's)", cfg.MaxRinkSheets.ToString()));
+                sheets.Add(MakeValueRow("Layout", cfg.RinkSheetLayout));
+                sheets.Add(MakeValueRow("Spacing",
+                    MaxPractice.SheetLayout.ParseMode(cfg.RinkSheetLayout) == MaxPractice.SheetLayoutMode.Vertical
+                        ? cfg.RinkSheetVerticalSpacing + "m down"
+                        : cfg.RinkSheetGridSpacingX + "m x " + cfg.RinkSheetGridSpacingZ + "m"));
+                sheets.Add(MakeValueRow("Empty rink torn down after",
+                    cfg.RinkSheetIdleTimeoutSeconds <= 0f ? "never" : cfg.RinkSheetIdleTimeoutSeconds + "s"));
+            }
         }
 
-        private void AddHelpRow(string command, string description)
+        private UITK.VisualElement MakeStateRow(string label, bool on)
+        {
+            var row = NewRow();
+
+            var name = new UITK.Label(label);
+            name.style.flexGrow = 1;
+            name.style.fontSize = 14;
+            name.style.color = new UITK.StyleColor(on ? TextPrimary : TextMuted);
+            name.style.whiteSpace = UITK.WhiteSpace.Normal;
+            ForceUIFont(name);
+            row.Add(name);
+
+            var pill = new UITK.Label(on ? "ON" : "OFF");
+            pill.style.fontSize = 11;
+            pill.style.unityFontStyleAndWeight = FontStyle.Bold;
+            pill.style.letterSpacing = 1;
+            pill.style.color = new UITK.StyleColor(on ? Accent : TextDim);
+            pill.style.minWidth = 42;
+            pill.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
+            pill.style.paddingTop = 4;
+            pill.style.paddingBottom = 4;
+            pill.style.backgroundColor = new UITK.StyleColor(
+                on ? new Color(0.863f, 0.314f, 0.314f, 0.15f) : new Color(1f, 1f, 1f, 0.05f));
+            SetRadius(pill, 4f);
+            ForceUIFont(pill);
+            row.Add(pill);
+
+            AddHover(row);
+            return row;
+        }
+
+        private UITK.VisualElement MakeValueRow(string label, string value)
+        {
+            var row = NewRow();
+
+            var name = new UITK.Label(label);
+            name.style.flexGrow = 1;
+            name.style.fontSize = 14;
+            name.style.color = new UITK.StyleColor(TextPrimary);
+            name.style.whiteSpace = UITK.WhiteSpace.Normal;
+            ForceUIFont(name);
+            row.Add(name);
+
+            var val = new UITK.Label(value);
+            val.style.fontSize = 13;
+            val.style.unityFontStyleAndWeight = FontStyle.Bold;
+            val.style.color = new UITK.StyleColor(Accent);
+            val.style.minWidth = 42;
+            val.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleRight);
+            ForceUIFont(val);
+            row.Add(val);
+
+            AddHover(row);
+            return row;
+        }
+
+        // ------------------------------------------------------------------
+        // Widgets
+        // ------------------------------------------------------------------
+
+        private static UITK.Label Title(string text, Color c)
+        {
+            var l = new UITK.Label(text);
+            l.style.fontSize = 42;
+            l.style.color = new UITK.StyleColor(c);
+            l.style.unityFontStyleAndWeight = FontStyle.Bold;
+            l.style.letterSpacing = 2;
+            ForceUIFont(l);
+            return l;
+        }
+
+        private static UITK.ScrollView MakeBody()
+        {
+            var sv = new UITK.ScrollView(UITK.ScrollViewMode.Vertical);
+            sv.style.flexGrow = 1;
+            sv.style.display = UITK.DisplayStyle.None;
+            return sv;
+        }
+
+        private UITK.Button MakeTab(string text, Action onClick, Func<bool> isActive)
+        {
+            var b = new UITK.Button(onClick) { text = text.ToUpperInvariant() };
+            b.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
+            b.style.height = 44;
+            b.style.flexGrow = 1;
+            b.style.paddingLeft = 14;
+            b.style.paddingRight = 14;
+            b.style.marginRight = 6;
+            b.style.marginBottom = 14;
+            b.style.fontSize = 17;
+            b.style.unityFontStyleAndWeight = FontStyle.Bold;
+            b.style.letterSpacing = 2;
+            b.style.borderTopLeftRadius = 8;
+            b.style.borderTopRightRadius = 8;
+            b.style.borderBottomLeftRadius = 0;
+            b.style.borderBottomRightRadius = 0;
+            SetBorderWidth(b, 0f);
+            b.style.borderBottomColor = new UITK.StyleColor(Accent);
+            b.style.backgroundColor = new UITK.StyleColor(TabInactiveBg);
+            b.style.color = new UITK.StyleColor(TextMuted);
+            b.focusable = false;
+            ForceUIFont(b);
+            AddTabHover(b, isActive);
+            return b;
+        }
+
+        private static void SetTabVisual(UITK.Button b, bool active)
+        {
+            if (b == null) return;
+            b.style.backgroundColor = new UITK.StyleColor(active ? TabActiveBg : TabInactiveBg);
+            b.style.color = new UITK.StyleColor(active ? TextPrimary : TextMuted);
+            b.style.borderBottomWidth = active ? 3 : 0;
+            b.style.borderBottomColor = new UITK.StyleColor(Accent);
+        }
+
+        private void ShowTab(UiTab t)
+        {
+            _activeTab = t;
+            if (_actionsBody != null)
+                _actionsBody.style.display = t == UiTab.Actions ? UITK.DisplayStyle.Flex : UITK.DisplayStyle.None;
+            if (_commandsBody != null)
+                _commandsBody.style.display = t == UiTab.Commands ? UITK.DisplayStyle.Flex : UITK.DisplayStyle.None;
+            if (_serverBody != null)
+                _serverBody.style.display = t == UiTab.Server ? UITK.DisplayStyle.Flex : UITK.DisplayStyle.None;
+
+            SetTabVisual(_tabActions, t == UiTab.Actions);
+            SetTabVisual(_tabCommands, t == UiTab.Commands);
+            SetTabVisual(_tabServer, t == UiTab.Server);
+        }
+
+        private static UITK.VisualElement AddSection(UITK.VisualElement parent, string label, string subtitle = null)
+        {
+            var box = new UITK.VisualElement();
+            var s = box.style;
+            s.flexDirection = UITK.FlexDirection.Column;
+            s.marginBottom = 14;
+            s.paddingLeft = 12;
+            s.paddingRight = 12;
+            s.paddingTop = 12;
+            s.paddingBottom = 4;
+            s.backgroundColor = new UITK.StyleColor(SectionBg);
+            SetRadius(box, 8f);
+            SetBorderWidth(box, 1f);
+            SetBorderColor(box, SectionBorder);
+            box.Add(MakeSectionHeader(label, subtitle));
+            parent.Add(box);
+            return box;
+        }
+
+        private static UITK.VisualElement MakeSectionHeader(string label, string subtitle = null)
+        {
+            var wrap = new UITK.VisualElement();
+            wrap.style.flexDirection = UITK.FlexDirection.Column;
+            wrap.style.marginBottom = 12;
+
+            var line = new UITK.VisualElement();
+            line.style.flexDirection = UITK.FlexDirection.Row;
+            line.style.alignItems = UITK.Align.Center;
+            line.style.marginBottom = 4;
+
+            var bar = new UITK.VisualElement();
+            bar.style.width = 4;
+            bar.style.height = 18;
+            bar.style.backgroundColor = new UITK.StyleColor(Accent);
+            bar.style.marginRight = 10;
+            SetRadius(bar, 2f);
+            line.Add(bar);
+
+            var title = new UITK.Label(label.ToUpperInvariant());
+            title.style.color = new UITK.StyleColor(TextPrimary);
+            title.style.fontSize = 16;
+            title.style.unityFontStyleAndWeight = FontStyle.Bold;
+            title.style.letterSpacing = 3;
+            ForceUIFont(title);
+            line.Add(title);
+            wrap.Add(line);
+
+            if (!string.IsNullOrEmpty(subtitle))
+            {
+                var sub = new UITK.Label(subtitle);
+                sub.style.color = new UITK.StyleColor(TextMuted);
+                sub.style.fontSize = 12;
+                sub.style.marginLeft = 14;
+                sub.style.whiteSpace = UITK.WhiteSpace.Normal;
+                ForceUIFont(sub);
+                wrap.Add(sub);
+            }
+
+            return wrap;
+        }
+
+        private static UITK.VisualElement NewRow()
         {
             var row = new UITK.VisualElement();
-            row.style.flexDirection = UITK.FlexDirection.Column;
-            row.style.height = 50;
+            row.style.flexDirection = UITK.FlexDirection.Row;
+            row.style.alignItems = UITK.Align.Center;
             row.style.marginBottom = 8;
             row.style.backgroundColor = new UITK.StyleColor(RowBg);
-            row.style.paddingLeft = 12;
+            row.style.paddingLeft = 14;
             row.style.paddingRight = 10;
-            row.style.paddingTop = 8;
-            row.style.paddingBottom = 8;
-
-            var cmd = new UITK.Label(command);
-            MakeReadable(cmd);
-            cmd.style.fontSize = 17;
-            row.Add(cmd);
-
-            var desc = new UITK.Label(description);
-            MakeReadable(desc);
-            desc.style.fontSize = 13;
-            desc.style.opacity = 0.8f;
-            row.Add(desc);
-
-            _helpSectionVE.Add(row);
+            row.style.paddingTop = 10;
+            row.style.paddingBottom = 10;
+            SetRadius(row, ROW_RADIUS);
+            return row;
         }
 
-        private bool TryApplyFromPanel()
+        private static void AddHover(UITK.VisualElement row)
         {
+            row.RegisterCallback<UITK.PointerEnterEvent>(_ => row.style.backgroundColor = new UITK.StyleColor(RowBgHover));
+            row.RegisterCallback<UITK.PointerLeaveEvent>(_ => row.style.backgroundColor = new UITK.StyleColor(RowBg));
+        }
+
+        /// <summary>
+        /// Hover and click feedback for a button, ported from CompAdjust's panel so the two mods
+        /// feel the same under the cursor. Both states brighten toward the accent rather than
+        /// washing out to white, and the base fill is restored on leave and on every geometry
+        /// change so a relayout cannot strand a button in its hover colour.
+        ///
+        /// <paramref name="holdsOwnFill"/> is for a button the panel repaints to show a state,
+        /// such as Bind while it listens for a key: while it returns true every handler stands
+        /// down instead of painting over that state.
+        /// </summary>
+        private static void AddButtonFlash(UITK.Button b, Color baseBg, Func<bool> holdsOwnFill = null, int flashMs = 170)
+        {
+            if (b == null) return;
+
+            Color hoverBg = Color.Lerp(baseBg, Accent, 0.35f);
+            Color flashBg = Color.Lerp(baseBg, Accent, 0.6f);
+
+            Func<bool> held = () =>
+            {
+                try { return holdsOwnFill != null && holdsOwnFill(); }
+                catch { return false; }
+            };
+
+            Action setBase = () =>
+            {
+                if (held()) return;
+                b.style.backgroundColor = new UITK.StyleColor(baseBg);
+            };
+
+            bool hovering = false, flashing = false;
+
+            b.RegisterCallback<UITK.PointerEnterEvent>(_ =>
+            {
+                hovering = true;
+                if (held()) return;
+                b.style.backgroundColor = new UITK.StyleColor(hoverBg);
+            });
+            b.RegisterCallback<UITK.PointerLeaveEvent>(_ =>
+            {
+                hovering = false;
+                if (!flashing) setBase();
+            });
+            b.RegisterCallback<UITK.GeometryChangedEvent>(_ =>
+            {
+                if (!hovering && !flashing) setBase();
+            });
+            b.RegisterCallback<UITK.PointerUpEvent>(_ =>
+            {
+                if (held()) return;
+                flashing = true;
+                b.style.backgroundColor = new UITK.StyleColor(flashBg);
+                b.schedule.Execute(() =>
+                {
+                    flashing = false;
+                    if (hovering && !held())
+                        b.style.backgroundColor = new UITK.StyleColor(hoverBg);
+                    else
+                        setBase();
+                }).ExecuteLater(flashMs);
+            });
+        }
+
+        /// <summary>
+        /// Hover for a tab. A tab already carries two painted states, so this lifts an inactive
+        /// tab toward the row-hover fill and brightens its text, then hands the paint back to
+        /// SetTabVisual on leave, attach and relayout. The active tab is left alone.
+        /// </summary>
+        private static void AddTabHover(UITK.Button b, Func<bool> isActive)
+        {
+            if (b == null || isActive == null) return;
+
+            Action apply = () =>
+            {
+                bool active;
+                try { active = isActive(); }
+                catch { return; }
+                SetTabVisual(b, active);
+            };
+            apply();
+
+            b.RegisterCallback<UITK.PointerEnterEvent>(_ =>
+            {
+                bool active;
+                try { active = isActive(); }
+                catch { return; }
+                if (active) return;
+                b.style.backgroundColor = new UITK.StyleColor(RowBgHover);
+                b.style.color = new UITK.StyleColor(TextPrimary);
+            });
+            b.RegisterCallback<UITK.PointerLeaveEvent>(_ => apply());
+            b.RegisterCallback<UITK.AttachToPanelEvent>(_ => apply());
+            b.RegisterCallback<UITK.GeometryChangedEvent>(_ => apply());
+        }
+
+        /// <summary>Small dim line under a section's rows - credits, caveats.</summary>
+        private static UITK.Label SectionFootnote(string text)
+        {
+            var l = new UITK.Label(text);
+            l.style.fontSize = 11;
+            l.style.color = new UITK.StyleColor(TextDim);
+            l.style.unityFontStyleAndWeight = FontStyle.Italic;
+            l.style.whiteSpace = UITK.WhiteSpace.Normal;
+            l.style.marginLeft = 14;
+            l.style.marginTop = 2;
+            l.style.marginBottom = 8;
+            ForceUIFont(l);
+            return l;
+        }
+
+        private static UITK.Label Note(string text, Color color)
+        {
+            var l = new UITK.Label(text);
+            l.style.fontSize = 12;
+            l.style.color = new UITK.StyleColor(color);
+            l.style.whiteSpace = UITK.WhiteSpace.Normal;
+            l.style.marginBottom = 12;
+            ForceUIFont(l);
+            return l;
+        }
+
+        private UITK.Button MakeFooterButton(string text, Action onClick)
+        {
+            var b = new UITK.Button(onClick) { text = text.ToUpperInvariant() };
+            b.style.height = 38;
+            b.style.minWidth = 124;
+            b.style.marginLeft = 8;
+            b.style.fontSize = 13;
+            b.style.unityFontStyleAndWeight = FontStyle.Bold;
+            b.style.letterSpacing = 1;
+            b.style.backgroundColor = new UITK.StyleColor(ButtonBg);
+            b.style.color = new UITK.StyleColor(TextPrimary);
+            b.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
+            SetRadius(b, BTN_RADIUS);
+            SetBorderWidth(b, 1f);
+            SetBorderColor(b, PanelBorder);
+            b.focusable = false;
+            ForceUIFont(b);
+            AddButtonFlash(b, ButtonBg);
+            return b;
+        }
+
+        private UITK.Button MakeRowButton(string text, float width, Color bg, Func<bool> holdsOwnFill = null)
+        {
+            var b = new UITK.Button { text = text.ToUpperInvariant() };
+            b.style.height = 30;
+            b.style.width = width;
+            b.style.flexShrink = 0;
+            b.style.marginLeft = 0;
+            b.style.marginRight = 0;
+            b.style.marginTop = 0;
+            b.style.marginBottom = 0;
+            b.style.paddingLeft = 0;
+            b.style.paddingRight = 0;
+            b.style.fontSize = 12;
+            b.style.unityFontStyleAndWeight = FontStyle.Bold;
+            b.style.letterSpacing = 1;
+            b.style.backgroundColor = new UITK.StyleColor(bg);
+            b.style.color = new UITK.StyleColor(TextPrimary);
+            b.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
+            SetRadius(b, BTN_RADIUS);
+            SetBorderWidth(b, 1f);
+            SetBorderColor(b, PanelBorder);
+            b.focusable = false;
+            ForceUIFont(b);
+            AddButtonFlash(b, bg, holdsOwnFill);
+            return b;
+        }
+
+        private static void SetRadius(UITK.VisualElement e, float r)
+        {
+            e.style.borderTopLeftRadius = r;
+            e.style.borderTopRightRadius = r;
+            e.style.borderBottomLeftRadius = r;
+            e.style.borderBottomRightRadius = r;
+        }
+
+        private static void SetBorderColor(UITK.VisualElement e, Color c)
+        {
+            e.style.borderTopColor = new UITK.StyleColor(c);
+            e.style.borderBottomColor = new UITK.StyleColor(c);
+            e.style.borderLeftColor = new UITK.StyleColor(c);
+            e.style.borderRightColor = new UITK.StyleColor(c);
+        }
+
+        private static void SetBorderWidth(UITK.VisualElement e, float w)
+        {
+            e.style.borderTopWidth = w;
+            e.style.borderBottomWidth = w;
+            e.style.borderLeftWidth = w;
+            e.style.borderRightWidth = w;
+        }
+
+        /// <summary>
+        /// Pull the game's own UI font so the panel doesn't fall back to Arial and
+        /// stand out against every other menu.
+        /// </summary>
+        private static Font GetUIFont()
+        {
+            if (_uiFont != null) return _uiFont;
             try
             {
-                var outBinds = new List<string>();
-                foreach (var row in _cmdRows)
-                {
-                    var selected = row.Dropdown?.value?.Trim();
-                    if (string.IsNullOrWhiteSpace(selected)) continue;
-
-                    string cmd;
-                    if (!LABEL_TO_COMMAND.TryGetValue(selected, out cmd))
-                    {
-                        cmd = selected.StartsWith("/") ? selected : "/" + selected.TrimStart('/');
-                    }
-
-                    var chord = row.Chord?.Trim();
-                    if (string.IsNullOrWhiteSpace(chord)) continue;
-                    outBinds.Add(cmd + ":" + chord);
-                }
-
-                MaxPracticeKeybindManager.Config.commandBinds = outBinds;
-                return true;
+                var uiManager = MonoBehaviourSingleton<UIManager>.Instance;
+                var textSettings = (uiManager != null && uiManager.PanelSettings != null)
+                    ? uiManager.PanelSettings.textSettings : null;
+                if (textSettings != null && textSettings.defaultFontAsset != null)
+                    _uiFont = textSettings.defaultFontAsset.sourceFontFile;
             }
-            catch (Exception e)
+            catch { }
+
+            if (_uiFont == null)
             {
-                Debug.LogError("[MaxPractice] Failed applying UI changes: " + e.Message);
-                return false;
+                try { _uiFont = Resources.GetBuiltinResource<Font>("Arial.ttf"); } catch { }
             }
+            return _uiFont;
         }
 
-        private void ResetDefaults()
+        private static void ForceUIFont(UITK.VisualElement ve)
         {
-            if (_isCapturing) CancelCapture();
-
-            // No default binds - reset just clears every row.
-            MaxPracticeKeybindManager.Config.commandBinds.Clear();
-            MaxPracticeKeybindManager.SaveConfig();
+            var f = GetUIFont();
+            if (f != null) ve.style.unityFont = new UITK.StyleFont(f);
         }
+
+        // ------------------------------------------------------------------
+        // Keybind capture
+        // ------------------------------------------------------------------
 
         private void StartCapture(UITK.Button button, Action<string> onCommit)
         {
@@ -829,12 +1506,12 @@ namespace MaxPractice
 
             if (_captureButton != null)
             {
-                _captureButton.text = "PRESS KEY";
-                _captureButton.style.backgroundColor = new UITK.StyleColor(new Color32(100, 80, 40, 255));
+                _captureButton.text = "...";
+                _captureButton.style.backgroundColor = new UITK.StyleColor(CaptureBg);
             }
 
             if (_captureLabel != null)
-                _captureLabel.text = "Press a key or combination of modifier + key to rebind.";
+                _captureLabel.text = "Press a key, or a modifier plus a key.";
             if (_captureOverlay != null)
             {
                 _captureOverlay.style.display = UITK.DisplayStyle.Flex;
@@ -847,15 +1524,7 @@ namespace MaxPractice
             _isCapturing = false;
             if (_captureOverlay != null) _captureOverlay.style.display = UITK.DisplayStyle.None;
             _captureCommit?.Invoke(spec);
-
-            if (_captureButton != null)
-            {
-                _captureButton.text = "BIND";
-                _captureButton.style.backgroundColor = new UITK.StyleColor(ButtonBg);
-            }
-
-            _captureButton = null;
-            _captureCommit = null;
+            ResetCaptureButton();
         }
 
         private void CancelCapture()
@@ -863,13 +1532,16 @@ namespace MaxPractice
             if (!_isCapturing) return;
             _isCapturing = false;
             if (_captureOverlay != null) _captureOverlay.style.display = UITK.DisplayStyle.None;
+            ResetCaptureButton();
+        }
 
+        private void ResetCaptureButton()
+        {
             if (_captureButton != null)
             {
                 _captureButton.text = "BIND";
                 _captureButton.style.backgroundColor = new UITK.StyleColor(ButtonBg);
             }
-
             _captureButton = null;
             _captureCommit = null;
         }
@@ -883,21 +1555,55 @@ namespace MaxPractice
             return w;
         }
 
-        private MaxPracticeKeybindManager.KeyChord SnapshotCurrentChord()
-        {
-            var keys = new List<KeyCode>();
-            bool ctrl = (Keyboard.current?.leftCtrlKey?.isPressed ?? false) || (Keyboard.current?.rightCtrlKey?.isPressed ?? false);
-            bool shift = (Keyboard.current?.leftShiftKey?.isPressed ?? false) || (Keyboard.current?.rightShiftKey?.isPressed ?? false);
-            bool alt = (Keyboard.current?.leftAltKey?.isPressed ?? false) || (Keyboard.current?.rightAltKey?.isPressed ?? false);
+        /// <summary>
+        /// Every KeyCode that can appear in a chord, in ascending order, resolved once.
+        ///
+        /// SnapshotCurrentChord used to walk `Enum.GetValues(typeof(KeyCode))` directly, and it
+        /// is called on every frame of a keybind capture. That allocates a fresh ~430-entry
+        /// array each time, and `foreach` over the non-generic Array enumerator BOXES every
+        /// element - so holding a key down for a second cost tens of thousands of short-lived
+        /// objects. The allowed set is a pure function of two static predicates and never
+        /// changes, so it is built on first use and kept.
+        /// </summary>
+        private static KeyCode[] _capturableKeys;
 
+        private static KeyCode[] CapturableKeys()
+        {
+            if (_capturableKeys != null) return _capturableKeys;
+
+            var found = new List<KeyCode>();
             foreach (KeyCode k in Enum.GetValues(typeof(KeyCode)))
             {
                 if (!MaxPracticeKeybindManager.IsAllowedKey(k)) continue;
                 if (MaxPracticeKeybindManager.IsModifierKey(k)) continue;
-                if (IsKeyPressed(k)) keys.Add(k);
+                found.Add(k);
+            }
+            found.Sort();
+            _capturableKeys = found.ToArray();
+            return _capturableKeys;
+        }
+
+        // Refilled per call rather than reallocated. Only the ToArray below escapes.
+        private readonly List<KeyCode> _chordScratch = new List<KeyCode>();
+
+        private MaxPracticeKeybindManager.KeyChord SnapshotCurrentChord()
+        {
+            var kb = Keyboard.current;
+            bool ctrl = (kb?.leftCtrlKey?.isPressed ?? false) || (kb?.rightCtrlKey?.isPressed ?? false);
+            bool shift = (kb?.leftShiftKey?.isPressed ?? false) || (kb?.rightShiftKey?.isPressed ?? false);
+            bool alt = (kb?.leftAltKey?.isPressed ?? false) || (kb?.rightAltKey?.isPressed ?? false);
+
+            var keys = _chordScratch;
+            keys.Clear();
+
+            // CapturableKeys is already sorted ascending and this appends in order, so the
+            // explicit re-sort the old code did here is redundant.
+            KeyCode[] candidates = CapturableKeys();
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                if (IsKeyPressed(candidates[i])) keys.Add(candidates[i]);
             }
 
-            keys.Sort((a, b) => a.CompareTo(b));
             return new MaxPracticeKeybindManager.KeyChord
             {
                 Keys = keys.ToArray(),
@@ -933,6 +1639,7 @@ namespace MaxPractice
         {
             var kb = Keyboard.current;
             if (kb == null && Mouse.current == null) return;
+            if (kb == null) return;
             if (IsChatOpen()) return;
 
             var bindings = MaxPracticeKeybindManager.GetBindings();
@@ -1047,173 +1754,9 @@ namespace MaxPractice
             }
         }
 
-        private void ShowTab(UiTab t)
-        {
-            _activeTab = t;
-
-            _commandsSectionVE.style.display = (t == UiTab.Commands) ? UITK.DisplayStyle.Flex : UITK.DisplayStyle.None;
-            _helpSectionVE.style.display = (t == UiTab.Help) ? UITK.DisplayStyle.Flex : UITK.DisplayStyle.None;
-            _serverSectionVE.style.display = (t == UiTab.Server) ? UITK.DisplayStyle.Flex : UITK.DisplayStyle.None;
-
-            if (t == UiTab.Server) RefreshServerSection();
-
-            SetTabVisual(_tabCommands, _activeTab == UiTab.Commands);
-            SetTabVisual(_tabHelp, _activeTab == UiTab.Help);
-            SetTabVisual(_tabServer, _activeTab == UiTab.Server);
-        }
-
-        private static void SetTabVisual(UITK.Button b, bool active)
-        {
-            b.style.backgroundColor = new UITK.StyleColor(active ? TabActiveBg : TabInactiveBg);
-            b.style.color = active ? Color.white : new Color(0.7f, 0.7f, 0.7f);
-            b.style.borderBottomWidth = active ? 3 : 0;
-        }
-
-        private static void AddTabHover(UITK.Button b, Func<bool> isActive)
-        {
-            b.focusable = false;
-            void Apply() => SetTabVisual(b, isActive());
-            Apply();
-
-            b.RegisterCallback<PointerEnterEvent>(_ =>
-            {
-                if (!isActive())
-                {
-                    b.style.backgroundColor = new UITK.StyleColor(Color.white);
-                    b.style.color = Color.black;
-                }
-            });
-            b.RegisterCallback<PointerLeaveEvent>(_ => Apply());
-            b.RegisterCallback<AttachToPanelEvent>(_ => Apply());
-            b.RegisterCallback<GeometryChangedEvent>(_ => Apply());
-        }
-
-        private void StyleDropdown(UITK.DropdownField dd)
-        {
-            dd.style.height = BTN_H;
-            dd.style.marginRight = GAP;
-            dd.style.flexGrow = 0;
-            dd.style.flexShrink = 1;
-            dd.style.flexBasis = 0;
-            dd.style.minWidth = 200;
-            dd.style.backgroundColor = new UITK.StyleColor(TextFieldBg);
-            dd.style.color = Color.white;
-            dd.style.unityFont = GetUIFont();
-            var lbl = dd.Q<UITK.Label>();
-            if (lbl != null)
-            {
-                lbl.style.color = Color.white;
-                lbl.style.unityFont = GetUIFont();
-            }
-        }
-
-        private void StyleTextField(UITK.TextField tf)
-        {
-            MakeReadable(tf);
-            tf.style.height = BTN_H;
-            tf.style.marginRight = GAP;
-
-            tf.style.flexGrow = 0;
-            tf.style.flexShrink = 1;
-            tf.style.flexBasis = 0;
-            tf.style.minWidth = 160;
-
-            var input = tf.childCount > 0 ? tf.ElementAt(0) : null;
-            if (input != null)
-            {
-                input.style.height = BTN_H;
-                input.style.flexGrow = 0;
-                input.style.flexShrink = 1;
-                input.style.flexBasis = 0;
-                input.style.minWidth = 160;
-                input.style.whiteSpace = UITK.WhiteSpace.NoWrap;
-                input.style.overflow = UITK.Overflow.Hidden;
-                input.style.textOverflow = UITK.TextOverflow.Clip;
-            }
-        }
-
-        private void StyleRowButton(UITK.Button b, float w, string label = null)
-        {
-            if (!string.IsNullOrEmpty(label)) b.text = label;
-
-            b.style.height = BTN_H;
-            b.style.minWidth = w;
-            b.style.maxWidth = w;
-            b.style.whiteSpace = UITK.WhiteSpace.NoWrap;
-            b.style.flexShrink = 0;
-
-            b.style.marginLeft = GAP;
-            b.style.paddingLeft = 12;
-            b.style.paddingRight = 12;
-            b.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
-
-            b.style.backgroundColor = new UITK.StyleColor(ButtonBg);
-            AddButtonFlashWhiteHover(b, (Color)ButtonBg);
-        }
-
-        private static void Flashable(UITK.Button b, Color baseBg, int flashMs = 140)
-        {
-            b.focusable = true;
-            void SetBase()
-            {
-                b.style.backgroundColor = new UITK.StyleColor(baseBg);
-                b.style.color = Color.white;
-            }
-
-            SetBase();
-            bool hover = false;
-            bool flashing = false;
-
-            b.RegisterCallback<PointerEnterEvent>(_ =>
-            {
-                hover = true;
-                b.style.backgroundColor = new UITK.StyleColor(Color.white);
-                b.style.color = Color.black;
-            });
-            b.RegisterCallback<PointerLeaveEvent>(_ =>
-            {
-                hover = false;
-                if (!flashing) SetBase();
-            });
-            b.RegisterCallback<GeometryChangedEvent>(_ => SetBase());
-
-            b.RegisterCallback<PointerUpEvent>(_ =>
-            {
-                flashing = true;
-                b.style.backgroundColor = new UITK.StyleColor(Color.white);
-                b.style.color = Color.black;
-                b.schedule.Execute(() =>
-                {
-                    flashing = false;
-                    if (!hover) SetBase();
-                }).StartingIn(flashMs);
-            });
-        }
-
-        private static void AddButtonFlash(UITK.Button b, int flashMs = 140)
-        {
-            var baseBg = b.style.backgroundColor.keyword != UITK.StyleKeyword.Null ? b.style.backgroundColor.value : b.resolvedStyle.backgroundColor;
-            Flashable(b, baseBg, flashMs);
-        }
-
-        private static void AddButtonFlashWhiteHover(UITK.Button b, Color baseBg, int flashMs = 140)
-        {
-            Flashable(b, baseBg, flashMs);
-        }
-
-        private static void AddChipButtonFlash(UITK.Button btn)
-        {
-            btn.RegisterCallback<UITK.PointerEnterEvent>(_ =>
-            {
-                btn.style.backgroundColor = new UITK.StyleColor(new Color32(180, 80, 80, 255));
-                btn.style.color = Color.white;
-            });
-            btn.RegisterCallback<UITK.PointerLeaveEvent>(_ =>
-            {
-                btn.style.backgroundColor = new UITK.StyleColor(ChipXBg);
-                btn.style.color = Color.white;
-            });
-        }
+        // ------------------------------------------------------------------
+        // Chat
+        // ------------------------------------------------------------------
 
         private static bool IsChatOpen()
         {
@@ -1226,6 +1769,22 @@ namespace MaxPractice
             return false;
         }
 
+        /// <summary>
+        /// Drop the game's chat input if it is focused, and give the keyboard back to the
+        /// panel. StopInput is UIChat's own close path - the same one its Esc and submit
+        /// handlers use - so it tears down the text field and the message-expiry tweens the
+        /// way the game expects, rather than us hiding a still-focused field.
+        /// </summary>
+        private static void CloseGameChat()
+        {
+            try
+            {
+                var chat = MonoBehaviourSingleton<UIManager>.Instance?.Chat;
+                if (chat != null && chat.IsFocused) chat.StopInput();
+            }
+            catch { }
+        }
+
         private static void TrySendChat(string text)
         {
             if (string.IsNullOrEmpty(text)) return;
@@ -1236,98 +1795,6 @@ namespace MaxPractice
                     chatMgr.Client_SendChatMessage(text, false, false);
             }
             catch { }
-        }
-
-        private void BuildServerSection()
-        {
-            _serverSectionVE.Clear();
-
-            var head = new UITK.Label("SERVER CONFIG");
-            MakeReadable(head);
-            head.style.unityFontStyleAndWeight = FontStyle.Normal;
-            head.style.fontSize = 30;
-            head.style.marginBottom = 10;
-            _serverSectionVE.Add(head);
-
-            RefreshServerSection();
-        }
-
-        private void RefreshServerSection()
-        {
-            // Rebuild everything after the title header (first child)
-            while (_serverSectionVE.childCount > 1)
-                _serverSectionVE.RemoveAt(1);
-
-            var cfg = ConfigManager.Config;
-            if (cfg == null)
-            {
-                var noData = new UITK.Label("No server config loaded.");
-                noData.style.fontSize = 20;
-                noData.style.marginTop = 20;
-                noData.style.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleCenter);
-                MakeReadable(noData);
-                _serverSectionVE.Add(noData);
-                return;
-            }
-
-            AddServerSectionHeader("COMMANDS");
-            _serverSectionVE.Add(MakeServerConfigRow("Spawn Puck", cfg.EnableSpawnPuck));
-            _serverSectionVE.Add(MakeServerConfigRow("Backpass", cfg.EnableBackpass));
-            _serverSectionVE.Add(MakeServerConfigRow("Pass", cfg.EnablePass));
-            _serverSectionVE.Add(MakeServerConfigRow("Yoyo", cfg.EnableYoyo));
-            _serverSectionVE.Add(MakeServerConfigRow("Pop", cfg.EnablePop));
-            _serverSectionVE.Add(MakeServerConfigRow("Save Practice", cfg.EnableSavePrac));
-            _serverSectionVE.Add(MakeServerConfigRow("Tip Practice", cfg.EnableTipPrac));
-            _serverSectionVE.Add(MakeServerConfigRow("Cones", cfg.EnableCones));
-            _serverSectionVE.Add(MakeServerConfigRow("Minefield", cfg.EnableMinefield));
-            _serverSectionVE.Add(MakeServerConfigRow("Traffic", cfg.EnableTraffic));
-            _serverSectionVE.Add(MakeServerConfigRow("Dummy", cfg.EnableDummy));
-            _serverSectionVE.Add(MakeServerConfigRow("Infinite Stamina", cfg.EnableInfiniteStamina));
-            _serverSectionVE.Add(MakeServerConfigRow("Tap Commands", cfg.EnableTapCommands));
-
-            AddServerSectionHeader("MISC");
-            _serverSectionVE.Add(MakeServerConfigRow("Goalie AI Persists During Game (Always-On)", cfg.GoalieAIPersistDuringGame));
-            _serverSectionVE.Add(MakeServerConfigRow("Enable Goalie AI Voting (/votegoalies)", cfg.EnableGoalieVoting));
-            _serverSectionVE.Add(MakeServerConfigRow("Pause Warmup Timer (Practice-Only Server)", cfg.PauseWarmupTimer));
-            _serverSectionVE.Add(MakeServerConfigRow("Disable Voting (Blocks /vs and /vw)", cfg.DisableVoting));
-        }
-
-        private void AddServerSectionHeader(string text)
-        {
-            var header = new UITK.Label(text);
-            header.style.fontSize = 20;
-            header.style.marginTop = 14;
-            header.style.marginBottom = 6;
-            header.style.color = new Color(0.9f, 0.9f, 0.5f);
-            ForceUIFont(header);
-            _serverSectionVE.Add(header);
-        }
-
-        private UITK.VisualElement MakeServerConfigRow(string featureName, bool enabled)
-        {
-            var row = new UITK.VisualElement();
-            row.style.flexDirection = UITK.FlexDirection.Row;
-            row.style.alignItems = UITK.Align.Center;
-            row.style.height = 40;
-            row.style.marginBottom = 4;
-            row.style.backgroundColor = new UITK.StyleColor(RowBg);
-            row.style.paddingLeft = 12;
-            row.style.paddingRight = 12;
-
-            var label = new UITK.Label(featureName);
-            label.style.flexGrow = 1;
-            label.style.fontSize = 20;
-            MakeReadable(label);
-            row.Add(label);
-
-            var status = new UITK.Label(enabled ? "ENABLED" : "DISABLED");
-            status.style.fontSize = 20;
-            status.style.unityFontStyleAndWeight = FontStyle.Bold;
-            status.style.color = enabled ? new Color(0.4f, 0.9f, 0.4f) : new Color(0.9f, 0.4f, 0.4f);
-            ForceUIFont(status);
-            row.Add(status);
-
-            return row;
         }
     }
 }

@@ -1,4 +1,4 @@
-// PracticePatches.cs - Harmony patches for practice features
+﻿// PracticePatches.cs - Harmony patches for practice features
 
 using System;
 using System.Linq;
@@ -111,10 +111,27 @@ public static class FakePlayerDetector
     
     /// <summary>
     /// PUBLIC API: Check if a player body belongs to a MaxPractice fake player.
+    /// Kept on `object` because other mods bind against this signature; our own
+    /// patches use the typed overloads below.
     /// </summary>
     public static bool IsMaxPracticeFakePlayerBody(object body)
     {
-        return IsAnyFakePlayerBody(body);
+        if (body == null) return false;
+        if (body is PlayerBody typed) return IsAnyFakePlayerBody(typed);
+
+        // Unknown body type from a caller we don't control. Resolve by name, and
+        // check the FIELD table as well as properties: on PlayerBody, `Player` is
+        // a public field, and GetProperty never inspects fields.
+        try
+        {
+            var t = body.GetType();
+            var member = (MemberInfo)t.GetProperty("Player") ?? t.GetField("Player");
+            Player player = member is PropertyInfo pi ? pi.GetValue(body) as Player
+                          : member is FieldInfo fi ? fi.GetValue(body) as Player
+                          : null;
+            return IsAnyFakePlayer(player);
+        }
+        catch { return false; }
     }
     
     /// <summary>
@@ -170,17 +187,18 @@ public static class FakePlayerDetector
         return false;
     }
     
-    public static bool IsFakePlayerBody(object body)
+    /// <summary>
+    /// PlayerBody.Player is a public FIELD in Puck (verified against the shipped
+    /// metadata for both b1153 and the current build — PlayerBody has no `Player`
+    /// property and no get_Player). This used to read it via
+    /// GetType().GetProperty("Player"), which never inspects fields, so it
+    /// returned false for every body — real and fake alike — and silently
+    /// disabled every CompTweaks finalizer and the AI-goalie tuning below.
+    /// </summary>
+    public static bool IsFakePlayerBody(PlayerBody body)
     {
         if (body == null) return false;
-        try
-        {
-            // Get Player property from body (works for both PlayerBodyV2 and PlayerBody)
-            var playerProp = body.GetType().GetProperty("Player");
-            if (playerProp == null) return false;
-            Player player = (Player)playerProp.GetValue(body);
-            return IsFakePlayer(player);
-        }
+        try { return IsFakePlayer(body.Player); }
         catch { return false; }
     }
     
@@ -232,17 +250,10 @@ public static class FakePlayerDetector
         return false;
     }
     
-    public static bool IsTrafficDummyBody(object body)
+    public static bool IsTrafficDummyBody(PlayerBody body)
     {
         if (body == null) return false;
-        try
-        {
-            // Get Player property from body (works for both PlayerBodyV2 and PlayerBody)
-            var playerProp = body.GetType().GetProperty("Player");
-            if (playerProp == null) return false;
-            Player player = (Player)playerProp.GetValue(body);
-            return IsTrafficDummy(player);
-        }
+        try { return IsTrafficDummy(body.Player); }
         catch { return false; }
     }
     
@@ -254,17 +265,10 @@ public static class FakePlayerDetector
         return IsFakePlayer(player) || IsTrafficDummy(player);
     }
     
-    public static bool IsAnyFakePlayerBody(object body)
+    public static bool IsAnyFakePlayerBody(PlayerBody body)
     {
         if (body == null) return false;
-        try
-        {
-            // Get Player property from body (works for both PlayerBodyV2 and PlayerBody)
-            var playerProp = body.GetType().GetProperty("Player");
-            if (playerProp == null) return false;
-            Player player = (Player)playerProp.GetValue(body);
-            return IsAnyFakePlayer(player);
-        }
+        try { return IsAnyFakePlayer(body.Player); }
         catch { return false; }
     }
 }
@@ -424,10 +428,33 @@ public static class SkipCompTweaks_MovementStartPatch
             SetPrivateField(type, movement, "turnAcceleration", 720f);
             SetPrivateField(type, movement, "turnBrakeAcceleration", 720f);
             SetPrivateField(type, movement, "turnDrag", 10f);
+
+            // The prefix returns false, so Movement.Start never runs for this
+            // goalie. Its entire body — disassembled from the shipped IL — is:
+            //     currentMaxSpeed     = maxForwardsSpeed;
+            //     currentAcceleration = forwardsAcceleration;
+            // Those two are what FixedUpdate actually drives from, so skipping
+            // Start without replicating it leaves the goalie at currentMaxSpeed 0:
+            // spawned, upright, and completely unable to move. Copy rather than
+            // hardcode so the values stay tied to the fields set above.
+            CopyPrivateField(type, movement, "maxForwardsSpeed", "currentMaxSpeed");
+            CopyPrivateField(type, movement, "forwardsAcceleration", "currentAcceleration");
         }
         catch { }
     }
-    
+
+    private static void CopyPrivateField(Type type, object obj, string fromField, string toField)
+    {
+        try
+        {
+            var src = type.GetField(fromField, BindingFlags.NonPublic | BindingFlags.Instance);
+            var dst = type.GetField(toField, BindingFlags.NonPublic | BindingFlags.Instance);
+            if (src != null && dst != null)
+                dst.SetValue(obj, src.GetValue(obj));
+        }
+        catch { }
+    }
+
     private static void SetPrivateField(Type type, object obj, string fieldName, float value)
     {
         try
@@ -496,11 +523,37 @@ public static class SkipCompTweaks_PlayerBodyFixedUpdatePatch
     {
         try
         {
+            // This exists only to fight CompTweaks' zero-drag config. With no
+            // CompTweaks there is nothing to fight, and re-asserting damping 50x/sec
+            // would stomp the game's own values. ApplyAIGoaliePhysics already gates
+            // on this; this postfix did not, which only became reachable once the
+            // fake-player detection above was repaired.
+            if (!CompTweaksDetector.IsCompTweaksLoaded) return;
             if (!NetworkManager.Singleton.IsServer) return;
             if (__instance == null) return;
-            if (!FakePlayerDetector.IsFakePlayerBody(__instance)) return;
 
-            var rb = __instance.GetComponent<Rigidbody>();
+            // Ordered cheapest-first, because this is PlayerBody.FixedUpdate: once per
+            // player per physics tick, ~50 Hz, for the whole session.
+            //
+            // The count test is what makes the common case free - no AI goalie on the ice
+            // means nothing to re-damp, and that is most of the time.
+            //
+            // The id comparison replaces IsFakePlayerBody. That helper is right, but its
+            // client-id fast path only short-circuits for a player who IS fake; a real
+            // player misses it and falls through to Username.Value.ToString(), so on a
+            // CompTweaks server every skater paid a string allocation every tick just to
+            // re-establish that they are not a dummy. Goalie ids only, matching what
+            // IsFakePlayer means - do NOT widen this to IsAnyFakeClientId, which would
+            // stamp goalie damping onto traffic dummies and passers too.
+            if (MaxPracticePlugin.FakePlayers.Count == 0) return;
+
+            var player = __instance.Player;   // public field; no GetComponent walk
+            if (player == null) return;
+            ulong ownerId = player.OwnerClientId;
+            if (ownerId != FakePlayerDetector.FAKE_RED_CLIENT_ID &&
+                ownerId != FakePlayerDetector.FAKE_BLUE_CLIENT_ID) return;
+
+            var rb = __instance.Rigidbody;   // public field; no GetComponent walk
             if (rb != null)
             {
                 rb.linearDamping = 4.0f;
@@ -718,6 +771,12 @@ public static class PracticeStaminaPatch
             if (__instance == null) return;
             if (!NetworkManager.Singleton.IsServer) return;
 
+            // Runs per PlayerBody per physics tick, and the set is empty on almost
+            // every server. Bail before resolving an id: GetSteamIdFromPlayer falls
+            // back to a FixedString->string round trip for an owner-id-0 host, which
+            // would otherwise allocate 50 times a second forever.
+            if (MaxPracticePlugin.InfiniteStaminaPlayers.Count == 0) return;
+
             var body = __instance as PlayerBody;
             if (body == null) return;
             var player = body.Player;
@@ -743,23 +802,42 @@ public static class PuckCollisionEnterPatch
         {
             if (__instance == null) return;
             if (!NetworkManager.Singleton.IsServer) return;
-            
+
+            // Both things this postfix feeds are warmup-only: LastTouchedPuck exists solely
+            // for /pop, and the yoyo bookkeeping below for /yoyo. Outside warmup it still ran
+            // a GetComponent<Stick> and a steam-id resolve on every puck-to-stick contact of a
+            // live game and threw the answer away - and GetSteamIdFromPlayer falls back to a
+            // FixedString->string round trip for an owner-id-0 host, so that was an allocation
+            // per collision as well.
+            if (!PracticeHelpers.IsWarmup) return;
+
+            // NOTE: an `if (collision.rigidbody == null) return;` fast path looks
+            // tempting here, but it is only valid if a Stick's colliders reach the
+            // Stick GameObject via attachedRigidbody. That holds today as far as we
+            // can tell, but it is not provable from the shipped metadata, and if it
+            // is ever false this postfix goes silently dead and takes yoyo and /pop
+            // with it. The game's own OnCollisionEnter does the same unguarded
+            // TryGetComponent, so match it.
             // Check if collision was with a stick
             Stick stick = collision.gameObject.GetComponent<Stick>();
             if (stick == null) return;
-            
+
             // Get the player who owns this stick
             var player = stick.Player;
             if (player == null) return;
-            
+
             // Get the player's steam ID
             ulong steamId = PracticeHelpers.GetSteamIdFromPlayer(player);
             ulong ownerId = player.NetworkObject != null ? player.NetworkObject.OwnerClientId : 0;
             if (steamId == 0)
                 steamId = ownerId;
-            
-            // Always track last touched puck for /pop command
-            YoyoManager.TrackLastTouchedPuckForPlayer(__instance, player);
+
+            // Track last touched puck for /pop — but never for AI. Traffic dummies and
+            // passers get a fresh client id on every spawn, so recording theirs grows
+            // LastTouchedPuck without bound and pins destroyed Pucks. Only a real
+            // command sender is ever read back out of it.
+            if (!FakePlayerDetector.IsAnyFakeClientId(ownerId))
+                YoyoManager.TrackLastTouchedPuckForPlayer(__instance, player);
             
             // Check if this player has yoyo mode enabled - if so, track their puck
             if (MaxPracticePlugin.YoyoPlayers.Contains(steamId))
@@ -794,15 +872,24 @@ public static class PuckCollisionExitPatch
         {
             if (__instance == null) return;
             if (!NetworkManager.Singleton.IsServer) return;
-            
+
+            // Warmup-only, same as the enter patch above.
+            if (!PracticeHelpers.IsWarmup) return;
+
+            // Unlike the enter patch, nothing here serves /pop - the only outcome is
+            // OnPuckFired for a player with yoyo on. When nobody has, the GetComponent and
+            // steam-id resolve needed to work out WHICH player cost more than the answer is
+            // worth, on every puck-to-stick separation.
+            if (MaxPracticePlugin.YoyoPlayers.Count == 0) return;
+
             // Check if collision was with a stick
             Stick stick = collision.gameObject.GetComponent<Stick>();
             if (stick == null) return;
-            
+
             // Get the player who owns this stick
             var player = stick.Player;
             if (player == null) return;
-            
+
             // Get the player's steam ID
             ulong steamId = PracticeHelpers.GetSteamIdFromPlayer(player);
             if (steamId == 0 && player.NetworkObject != null)
@@ -853,15 +940,17 @@ public static class FakePlayerStickCollisionPatch
                 return;
             }
             
-            bool isFake = FakePlayerDetector.IsAnyFakePlayer(player);
+            // Bail before resolving the username: Dbg takes an already-built string,
+            // so the interpolation below is paid whether or not debug logging is on,
+            // and FixedString.ToString() allocates. Real players are the common case.
+            if (!FakePlayerDetector.IsAnyFakePlayer(player))
+                return;
+
             string username = "unknown";
             try { username = player.Username.Value.ToString(); } catch { }
-            
-            ConfigManager.Dbg($"[MaxPractice] FakePlayerStickCollisionPatch: Stick spawned for {username}, isFake={isFake}, clientId={player.OwnerClientId}");
-            
-            if (!isFake)
-                return;
-            
+
+            ConfigManager.Dbg($"[MaxPractice] FakePlayerStickCollisionPatch: Stick spawned for {username}, clientId={player.OwnerClientId}");
+
             // Re-enable all colliders on this stick to fix CurvedStick disabling them
             ConfigManager.Log($"[MaxPractice] Enabling stick collision for fake player: {username}");
             EnableStickCollision(__instance);
@@ -1040,21 +1129,36 @@ public static class FakePlayerStickCollisionPatch
 [HarmonyPatch(typeof(Stick), "FixedUpdate")]
 public static class FakePlayerStickFixedUpdatePatch
 {
-    private static int frameCounter = 0;
-    private const int CHECK_INTERVAL = 150; // ~3 seconds at 50fps
-    
+    private const float CHECK_SECONDS = 3f;
+
+    // Gate on time, latched to a physics tick — NOT on an invocation counter.
+    // Stick.FixedUpdate runs once per Stick *instance* per tick, so a shared
+    // counter advances N per tick and `counter % 150 == 0` only ever lands on
+    // the sticks whose per-tick ordinal is a multiple of gcd(N, 150): with 10
+    // sticks that is exactly one stick, checked every 0.3s, while the other
+    // nine — including the fake ones this patch exists for — are never swept.
+    // Latching on fixedTime instead lets every stick alive on the opening tick
+    // through, once every CHECK_SECONDS, which is what the comment always claimed.
+    private static float _openTick = -1f;
+    private static float _nextCheck = 0f;
+
     [HarmonyPostfix]
     [HarmonyPriority(Priority.Last)]
     public static void Postfix(Stick __instance)
     {
-        frameCounter++;
-        if (frameCounter % CHECK_INTERVAL != 0) return;
-        
         try
         {
             if (__instance == null) return;
             if (!NetworkManager.Singleton.IsServer) return;
-            
+
+            float tick = Time.fixedTime;
+            if (tick != _openTick)
+            {
+                if (tick < _nextCheck) return;
+                _openTick = tick;
+                _nextCheck = tick + CHECK_SECONDS;
+            }
+
             var player = __instance.Player;
             if (player == null || !FakePlayerDetector.IsAnyFakePlayer(player))
                 return;
@@ -1112,20 +1216,34 @@ public static class FakePlayerStickFixedUpdatePatch
 }
 
 // ============================================================================
-// AUTO-SHOW CHAT ON NEW MESSAGE — client-side
+// AUTO-SHOW CHAT ON NEW SYSTEM MESSAGE — client-side
 // Without this, the chat panel may be hidden when our mod sends system messages
 // (vote results, "Puck spawned.", etc.), so players don't see the feedback.
 // Patches UIChat.AddChatMessage (client-only) to call Show() right after a message
 // is added to the message list. On dedicated servers UIChat instances don't exist,
 // so the patch is dormant there.
+//
+// Limited to system messages. It used to fire on EVERY message, which meant a
+// warmup-only practice mod was reopening the chat panel on every client for every
+// line of ordinary player chat, all game long — overriding whatever the player had
+// chosen and doing it most often during live play, when the mod should be invisible.
+// Our own feedback arrives as a system message: PracticeHelpers sends through the
+// string overloads of ChatManager.Server_BroadcastChatMessage /
+// Server_SendChatMessage, which build the ChatMessage server-side with IsSystem set.
 // ============================================================================
 [HarmonyPatch(typeof(UIChat), nameof(UIChat.AddChatMessage))]
 public static class UIChat_AutoShow_Patch
 {
     [HarmonyPostfix]
-    public static void Postfix(UIChat __instance)
+    public static void Postfix(UIChat __instance, ChatMessage chatMessage)
     {
-        try { if (__instance != null) __instance.Show(); }
+        try
+        {
+            if (__instance == null) return;
+            // ChatMessage is a class here, not a struct - null is reachable.
+            if (chatMessage == null || !chatMessage.IsSystem) return;
+            __instance.Show();
+        }
         catch { }
     }
 }

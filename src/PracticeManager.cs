@@ -1,4 +1,4 @@
-// PracticeManager.cs - Handles warmup phase management and cleanup
+﻿// PracticeManager.cs - Handles warmup phase management and cleanup
 
 using System;
 using System.Collections;
@@ -82,20 +82,32 @@ public class PracticeManager : MonoBehaviour
             if (!NetworkManager.Singleton.IsServer) return;
             
             ulong clientId = (ulong)message["clientId"];
-            
-            // Look up the steamId for this clientId
-            var playerManager = MonoBehaviourSingleton<PlayerManager>.Instance;
-            if (playerManager == null) return;
-            
-            var player = playerManager.GetPlayerByClientId(clientId);
-            if (player == null) return;
-            
-            // Get steamId using helper method (handles FixedString conversion)
-            ulong steamId = PracticeHelpers.GetSteamIdFromPlayer(player);
-            if (steamId == 0) return;
 
-            // Clean up traffic owned by this player
+            // Keyed by client id alone, so they run first and unconditionally.
+            //
+            // These two used to sit at the BOTTOM of this method, behind three early returns
+            // - no PlayerManager, no Player for the id, no resolvable steamId. On a real
+            // disconnect the Player is usually already despawned when this event arrives, so
+            // `player == null` was the ordinary path rather than the exceptional one, and the
+            // whole cleanup below was being skipped along with them.
+            RinkSheets.OnClientDisconnected(clientId);
+            ClientVersionCheck.ForgetClient(clientId);
+
+            // The other key per-player state may be filed under. GetSteamIdFromPlayer prefers
+            // OwnerClientId, so when the Player has gone and we cannot ask, clientId is not a
+            // guess - it is the value those entries were most likely written with.
+            ulong steamId = clientId;
+            var playerManager = MonoBehaviourSingleton<PlayerManager>.Instance;
+            var player = playerManager != null ? playerManager.GetPlayerByClientId(clientId) : null;
+            if (player != null)
+            {
+                ulong resolved = PracticeHelpers.GetSteamIdFromPlayer(player);
+                if (resolved != 0) steamId = resolved;
+            }
+
+            // Clean up traffic and props owned by this player
             MaxPracticePlugin.CleanupPlayerTraffic(steamId);
+            MaxPracticePlugin.CleanupPlayerProps(steamId);
 
             // Wipe per-player command/yoyo state so HashSets/Dicts don't accumulate
             // dead entries over a long-running server session. Pass both keys —
@@ -104,6 +116,7 @@ public class PracticeManager : MonoBehaviour
             MaxPracticePlugin.CleanupPlayerState(steamId, clientId);
             if (YoyoManager.Instance != null)
                 YoyoManager.Instance.CleanupForPlayer(steamId, clientId);
+            SkaterAI.ForgetRecordings(steamId, clientId);
         }
         catch (Exception) { }
     }
@@ -137,7 +150,8 @@ public class PracticeManager : MonoBehaviour
                     if (steamId != 0)
                     {
                         MaxPracticePlugin.CleanupPlayerTraffic(steamId);
-                        Debug.Log($"[MaxPractice] Cleaned up traffic for player who left position: {steamId}");
+                        MaxPracticePlugin.CleanupPlayerProps(steamId);
+                        Debug.Log($"[MaxPractice] Cleaned up traffic and props for player who left position: {steamId}");
                     }
                 }
             }
@@ -262,9 +276,11 @@ public class PracticeManager : MonoBehaviour
     {
         // Wait a bit for game state to settle
         yield return new WaitForSeconds(0.5f);
-        
-        var ui = UnityEngine.Object.FindFirstObjectByType<UIChat>();
-        
+
+        // (A FindFirstObjectByType<UIChat> used to sit here. Nothing below reads it, and on a
+        // dedicated server there is no UIChat to find, so it was a whole-scene scan for a
+        // value that was discarded.)
+
         // Respawn red goalie AI if it was despawned and no real goalie exists
         if (redGoalieAIDespawnedForReplay)
         {
@@ -288,6 +304,18 @@ public class PracticeManager : MonoBehaviour
 
     void Update()
     {
+        // Runs on clients too - this is what puts the cone visual on their screen,
+        // so it has to sit above the server-only guard.
+        PropNetwork.Tick();
+
+        // Same: the yoyo string is drawn client-side from a server announcement.
+        YoyoStringNetwork.Tick();
+
+        // Same deal: a client builds its own copy of every practice sheet the server
+        // announces, so this cannot sit behind the server guard either.
+        RinkSheets.Tick();
+        ClientVersionCheck.Tick();
+
         if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer) return;
 
         PracticeHelpers.FlushPendingChats();
@@ -299,6 +327,28 @@ public class PracticeManager : MonoBehaviour
         // Notify the goalie AI manager of phase changes so it can run intermission/sad/teleport hooks.
         var gmPhase = NetworkBehaviourSingleton<GameManager>.Instance;
         if (gmPhase != null) GoalieAIManager.NotifyPhase(gmPhase.Phase);
+
+        // These two carry their own intervals and so have to be sampled every frame to
+        // honour them. They used to sit BELOW the 10 s gate, which is a coarser sieve than
+        // either of them: the 5 s goalie check only ever got asked on a 10 s boundary, so
+        // it ran every 10 s, and the 15 s visual check - needing 15 s elapsed but only ever
+        // asked every 10 s - actually ran every 20 s.
+        if (gmPhase != null && gmPhase.Phase == GamePhase.Warmup)
+        {
+            if (Time.realtimeSinceStartup >= nextPuckCheckTime)
+            {
+                nextPuckCheckTime = Time.realtimeSinceStartup + 5f;
+                CheckForRealGoalies();
+            }
+
+            // Periodically validate cone/minefield puck visuals (fixes mesh/material loss
+            // on player join/leave)
+            if (Time.realtimeSinceStartup >= nextPuckVisualCheckTime)
+            {
+                nextPuckVisualCheckTime = Time.realtimeSinceStartup + 15f;
+                ValidateHandlePuckVisuals();
+            }
+        }
 
         if (Time.realtimeSinceStartup < nextCheckTime) return;
         nextCheckTime = Time.realtimeSinceStartup + 10f;
@@ -316,19 +366,6 @@ public class PracticeManager : MonoBehaviour
             }
         }
 
-        // Check for real goalies periodically
-        if (gm != null && gm.Phase == GamePhase.Warmup && Time.realtimeSinceStartup >= nextPuckCheckTime)
-        {
-            nextPuckCheckTime = Time.realtimeSinceStartup + 5f;
-            CheckForRealGoalies();
-        }
-        
-        // Periodically validate cone/minefield puck visuals (fixes mesh/material loss on player join/leave)
-        if (gm != null && gm.Phase == GamePhase.Warmup && Time.realtimeSinceStartup >= nextPuckVisualCheckTime)
-        {
-            nextPuckVisualCheckTime = Time.realtimeSinceStartup + 15f; // Check every 15 seconds
-            ValidateHandlePuckVisuals();
-        }
     }
     
     private void ValidateHandlePuckVisuals()
@@ -344,6 +381,24 @@ public class PracticeManager : MonoBehaviour
                 foreach (var puck in puckList)
                 {
                     if (puck == null || puck.gameObject == null) continue;
+
+                    // Cone pucks want the cone back, not the puck mesh. Apply is a
+                    // no-op when the cone is still there.
+                    // ConeVisual re-asserts its own renderers, colliders, and
+                    // player/stick collision ignores every 2s, so this only has to
+                    // rebuild a cone that lost its GameObject entirely.
+                    if (MaxPracticePlugin.PropPucks.TryGetValue(puck, out var kind))
+                    {
+                        // Hand the owner back in: a shooter rebuilt without one loses its
+                        // team colour and its nameplate, and this sweep runs every 15 s.
+                        Player propOwner = null;
+                        if (MaxPracticePlugin.PropOwner.TryGetValue(puck, out ulong ownerSteamId))
+                            propOwner = PracticeHelpers.FindPlayerBySteamId(ownerSteamId);
+
+                        PropNetwork.ApplyLocal(puck, kind, true, propOwner);
+                        continue;
+                    }
+
                     PracticeHelpers.ValidateAndRepairPuckVisuals(puck);
                 }
             }
@@ -358,19 +413,30 @@ public class PracticeManager : MonoBehaviour
     {
         MaxPracticePlugin.InfiniteStaminaPlayers.Clear();
         
+        // Both session dictionaries, not just the shooter one. The tip-practice routine
+        // has no phase check of its own - it only ends on its 120 s timer - so leaving it
+        // running kept firing pucks through the crease all through the faceoff and live
+        // play, and the stale entry made the player's next /tipprac read as "stop".
+        var gameMgr = NetworkBehaviourSingleton<GameManager>.Instance;
         foreach (var kv in MaxPracticePlugin.ActiveShooterSessions)
         {
-            var gm = NetworkBehaviourSingleton<GameManager>.Instance;
-            if (gm != null)
-                gm.StopCoroutine(kv.Value);
+            if (gameMgr != null)
+                gameMgr.StopCoroutine(kv.Value);
         }
         MaxPracticePlugin.ActiveShooterSessions.Clear();
-        
+
+        foreach (var kv in MaxPracticePlugin.ActiveTipPracSessions)
+        {
+            if (gameMgr != null)
+                gameMgr.StopCoroutine(kv.Value);
+        }
+        MaxPracticePlugin.ActiveTipPracSessions.Clear();
+
         foreach (var kv in MaxPracticePlugin.SpawnedPucks)
         {
             foreach (var p in kv.Value)
             {
-                if (p?.gameObject != null)
+                if (p != null && p.gameObject != null)
                     try { UnityEngine.Object.Destroy(p.gameObject); } catch { }
             }
         }
@@ -381,13 +447,18 @@ public class PracticeManager : MonoBehaviour
         {
             foreach (var p in kv.Value)
             {
-                if (p?.gameObject != null)
+                if (p != null && p.gameObject != null)
                     try { UnityEngine.Object.Destroy(p.gameObject); } catch { }
             }
         }
         MaxPracticePlugin.HandlePucks.Clear();
         MaxPracticePlugin.HandleUseCount.Clear();
-        
+        MaxPracticePlugin.MinefieldUseCount.Clear();
+        MaxPracticePlugin.PropPucks.Clear();
+        MaxPracticePlugin.PropOwner.Clear();
+        MaxPracticePlugin.PlayerShooter.Clear();
+        MaxPracticePlugin.PlayerMiniNet.Clear();
+
         // Keep goalie dummies through phase transitions if EITHER the always-on config OR a
         // passed /votegoalies vote (GoalieAIManager.AutoEnabled) says they should persist.
         // Otherwise CleanupDummies wipes them on the Warmup→PreGame transition and we end up
@@ -397,6 +468,20 @@ public class PracticeManager : MonoBehaviour
             MaxPracticePlugin.CleanupDummies();
         }
         
+        // Extra sheets are a warmup thing. Leaving them standing through a game would
+        // strand anyone on one somewhere the game's own spawn logic knows nothing about.
+        RinkSheets.CloseAll("left warmup");
+
+        // Yoyo, pass and tap settings are warmup tools too, and several of them name a
+        // shooter prop that the HandlePucks sweep above has already destroyed.
+        MaxPractice.YoyoManager.ResetAllPlayerState();
+
+        // Traffic RECORDING is not an AI skater, so ClearAllAISkaters never touched it and
+        // nothing else did either: RecordMovement loops on this dictionary, so a live
+        // recording kept sampling straight through the faceoff and into play. Clearing the
+        // dictionary is what ends the coroutine - it has no handle to stop.
+        SkaterAI.ActiveRecordings.Clear();
+
         // Always clear traffic and passers on phase change (they're not goalies)
         SkaterAI.ClearAllAISkaters();
         MaxPracticePlugin.TrafficDummies.Clear();

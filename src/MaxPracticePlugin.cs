@@ -1,4 +1,4 @@
-// MaxPractice Plugin - Practice mode features for Puck game
+﻿// MaxPractice Plugin - Practice mode features for Puck game
 // Handles: Save practice, dummy goalies, infinite stamina, puck spawning, handling drills
 
 using System;
@@ -46,9 +46,47 @@ public class MaxPracticePlugin : IPuckPlugin
     
     // Track handle pucks per player (steamId -> list of pucks)
     public static Dictionary<ulong, List<Puck>> HandlePucks = new Dictionary<ulong, List<Puck>>();
+
+    // Handle pucks wearing a prop - a cone, a puck shooter, or a mini net - mapped
+    // to which one. The puck is only ever the anchor; the prop is a child mesh on
+    // it, so destroying the puck cleans everything up. Dead entries are reaped by
+    // PropNetwork's broadcast pass.
+    public static Dictionary<Puck, PropKind> PropPucks = new Dictionary<Puck, PropKind>();
+
+    // Who spawned each prop, by steamId. Kept beside PropPucks rather than derived from
+    // PlayerShooter/PlayerMiniNet/HandlePucks because those are keyed the other way round
+    // and a reverse scan per broadcast would be O(props x players). Reaped alongside
+    // PropPucks in PropNetwork.PruneDead.
+    public static Dictionary<Puck, ulong> PropOwner = new Dictionary<Puck, ulong>();
+
+    // Per-player props that aren't cones, so a second /pass or /mininet replaces the
+    // first rather than littering the rink. Keyed by steamId.
+    public static Dictionary<ulong, Puck> PlayerShooter = new Dictionary<ulong, Puck>();
+    public static Dictionary<ulong, Puck> PlayerMiniNet = new Dictionary<ulong, Puck>();
+
+    /// <summary>Despawn a prop puck and forget it. Safe to call with null.</summary>
+    public static void DestroyProp(Puck puck)
+    {
+        if (puck == null) return;
+        PropPucks.Remove(puck);
+        PropOwner.Remove(puck);
+        try
+        {
+            if (puck.gameObject != null) UnityEngine.Object.Destroy(puck.gameObject);
+        }
+        catch { }
+    }
     
     // Track handle command uses per player (steamId -> use count)
     public static Dictionary<ulong, int> HandleUseCount = new Dictionary<ulong, int>();
+
+    // /minefield's own counter. It used to share HandleUseCount under the key steamId + 1,
+    // which is only safe if these keys are sparse - and they are not. GetSteamIdFromPlayer
+    // PREFERS NetworkObject.OwnerClientId, so on a dedicated server every client has a small
+    // sequential id and player N's minefield key was exactly player N+1's cones key: one
+    // player's minefield locked the next player out of /cones, and clearing either handed
+    // the other a free use. A separate dictionary cannot alias.
+    public static Dictionary<ulong, int> MinefieldUseCount = new Dictionary<ulong, int>();
     
     // Track yoyo mode per player (steamId -> enabled)
     public static HashSet<ulong> YoyoPlayers = new HashSet<ulong>();
@@ -68,6 +106,7 @@ public class MaxPracticePlugin : IPuckPlugin
     // NullRef suppression for fake players using ILogHandler
     private static bool _nullRefHandlerRegistered = false;
     private static NullRefSuppressingLogHandler _logHandler;
+    private static ILogHandler _previousLogHandler;
     
     /// <summary>
     /// Suppress NullReferenceException spam from game components on fake players.
@@ -85,12 +124,39 @@ public class MaxPracticePlugin : IPuckPlugin
         
         try
         {
-            var defaultHandler = Debug.unityLogger.logHandler;
-            _logHandler = new NullRefSuppressingLogHandler(defaultHandler);
+            _previousLogHandler = Debug.unityLogger.logHandler;
+            _logHandler = new NullRefSuppressingLogHandler(_previousLogHandler);
             Debug.unityLogger.logHandler = _logHandler;
             _nullRefHandlerRegistered = true;
         }
         catch (Exception) { }
+    }
+
+    /// <summary>
+    /// Put the game's own log handler back.
+    ///
+    /// The filter is broad - it drops any NullReferenceException whose stack mentions
+    /// PlayerBody, Movement, Stick., PlayerInput, NetworkVariable and more - so leaving it
+    /// installed after a disable swallows the GAME's exceptions too, which is exactly the
+    /// evidence someone is looking for when they disable the mod to test whether it is at
+    /// fault. BasePlugin.UnloadAssembly() does not really unload us, so nothing else undoes
+    /// this. Only unhook if we are still the installed handler: another mod may have chained
+    /// itself on top since, and stomping its handler would be the same bug in reverse.
+    /// </summary>
+    private static void UnregisterNullRefSuppression()
+    {
+        if (!_nullRefHandlerRegistered) return;
+
+        try
+        {
+            if (ReferenceEquals(Debug.unityLogger.logHandler, _logHandler) && _previousLogHandler != null)
+                Debug.unityLogger.logHandler = _previousLogHandler;
+        }
+        catch (Exception) { }
+
+        _logHandler = null;
+        _previousLogHandler = null;
+        _nullRefHandlerRegistered = false;
     }
     
     /// <summary>
@@ -116,8 +182,6 @@ public class MaxPracticePlugin : IPuckPlugin
             // Always suppress NullReferenceExceptions from known sources
             if (exception is NullReferenceException)
             {
-                string stackTrace = exception.StackTrace ?? "";
-                
                 // Decrement frame counter
                 if (SuppressFrameCount > 0)
                     SuppressFrameCount--;
@@ -125,7 +189,33 @@ public class MaxPracticePlugin : IPuckPlugin
                 // During suppression window, suppress all NullRefs
                 if (SuppressFrameCount > 0)
                     return;
-                
+
+                // Nothing of ours on the ice means nothing of ours can be throwing, so let it
+                // through without looking. Two reasons this matters, and the second is the
+                // bigger one:
+                //
+                //  - exception.StackTrace FORMATS the whole trace into a fresh string every
+                //    time it is read, and the filter below then runs thirteen substring
+                //    searches over it. That was happening for every NullReferenceException
+                //    anywhere in the process, ours or not, for the entire session.
+                //  - The filter is deliberately broad (PlayerBody, Movement, Stick.,
+                //    NetworkVariable...), so while it is armed it swallows the GAME's
+                //    NullReferenceExceptions too. Someone debugging a crash with no AI
+                //    players on the ice was losing evidence to a mod that had nothing to
+                //    suppress - the same failure UnregisterNullRefSuppression exists to
+                //    avoid after a disable.
+                //
+                // Deliberately AFTER the countdown above: SuppressNullRefsFor is called just
+                // before a fake player spawns, when FakePlayers is still empty, and that
+                // window has to keep working.
+                if (FakePlayers.Count == 0)
+                {
+                    _defaultHandler.LogException(exception, context);
+                    return;
+                }
+
+                string stackTrace = exception.StackTrace ?? "";
+
                 // Always suppress NullRefs from known problematic sources on fake players
                 if (stackTrace.Contains("StickPositioner") || stackTrace.Contains("PlayerInput") ||
                     stackTrace.Contains("PlayerBodyV2") || stackTrace.Contains("PlayerBody") || stackTrace.Contains("Movement") ||
@@ -167,10 +257,21 @@ public class MaxPracticePlugin : IPuckPlugin
             go.AddComponent<YoyoManager>();
             
             // Add UI only on client (not dedicated server)
-            if (!Application.isBatchMode && 
+            if (!Application.isBatchMode &&
                 UnityEngine.SystemInfo.graphicsDeviceType != UnityEngine.Rendering.GraphicsDeviceType.Null)
             {
+                // The menu is our own F3 panel now, not a ModMenuHub entry. Purge any
+                // registration an older build left in the shared hub file - the
+                // callback it points at no longer exists, so it would sit in every
+                // other Ponce mod's hub as a button that does nothing.
+                try { PonceMods.Shared.ModMenuHub.UnregisterMod("MaxPractice"); }
+                catch { }
+
                 go.AddComponent<MaxPracticeUI>();
+
+                // Only meaningful where that panel exists: it blocks the game's chat-open
+                // action for as long as the panel is up.
+                MaxPractice.MenuInputBlock.Apply(harmony);
             }
             
             UnityEngine.Object.DontDestroyOnLoad(go);
@@ -223,10 +324,64 @@ public class MaxPracticePlugin : IPuckPlugin
 
     public bool OnDisable()
     {
+        // finally, not a trailing statement: the log filter is broad enough to swallow the
+        // game's own NullReferenceExceptions, and everything below can throw - CleanupDummies
+        // reaches NetworkObject.Despawn, which throws NotServerException once the
+        // NetworkManager has gone. A throw used to leave the filter installed for the rest of
+        // the process with no second chance, because a later re-enable sees
+        // _nullRefHandlerRegistered still true and early-returns.
+        try
+        {
+            return DisableInternal();
+        }
+        finally
+        {
+            UnregisterNullRefSuppression();
+        }
+    }
+
+    private bool DisableInternal()
+    {
         try
         {
             var manager = GameObject.Find("MaxPracticeManager");
             if (manager != null) UnityEngine.Object.Destroy(manager);
+
+            // Drop the named-message handler and put every coned puck back to
+            // looking like a puck before we unpatch.
+            // Tear down the practice sheets before unpatching: they own Harmony patches
+            // of their own and DontDestroyOnLoad geometry that would otherwise outlive
+            // the mod and follow the player onto the next server.
+            try { MaxPractice.RinkSheets.Shutdown(); }
+            catch { }
+
+            try { MaxPractice.ClientVersionCheck.Shutdown(); }
+            catch { }
+
+            // Put back any minimap dots we were holding hidden. The prefix that would
+            // normally restore them is about to be unpatched, and the dots themselves
+            // outlive the mod - so skipping this leaves players invisible on the minimap
+            // until their body next respawns.
+            try { MaxPractice.MinimapSheetView.Reset(); }
+            catch { }
+
+            try
+            {
+                MaxPractice.PropNetwork.Shutdown();
+                // Labels are unparented, so destroying the props does not take them with it.
+                MaxPractice.PropLabel.DestroyAll();
+                MaxPractice.YoyoStringNetwork.Shutdown();
+                MaxPractice.YoyoStringAsset.Dispose();
+                MaxPractice.ConeAsset.Dispose();
+                MaxPractice.ShooterAsset.Dispose();
+                MaxPractice.MiniNetAsset.Dispose();
+                MaxPractice.PropStyle.Dispose();
+                PropPucks.Clear();
+                PropOwner.Clear();
+                PlayerShooter.Clear();
+                PlayerMiniNet.Clear();
+            }
+            catch { }
 
             // Cleanup goalie AI through the manager so it clears its component refs and AutoEnabled state.
             try
@@ -236,9 +391,59 @@ public class MaxPracticePlugin : IPuckPlugin
             }
             catch { }
 
-            // Cleanup dummy goalies
-            CleanupDummies();
-            
+            // Cleanup dummy goalies.
+            //
+            // Guarded like every one of its neighbours, and for the reason OnDisable's own
+            // comment already spells out: CleanupDummies reaches NetworkObject.Despawn,
+            // which throws NotServerException once the NetworkManager has gone. Unguarded,
+            // that throw unwound past harmony.UnpatchSelf() below and left every patch
+            // installed - so the next enable ran PatchAll() on top of them and every hooked
+            // game method got its prefix/postfix run twice.
+            try { CleanupDummies(); }
+            catch (Exception e) { Debug.LogWarning("[MaxPractice] CleanupDummies failed during disable: " + e.Message); }
+
+            // These coroutines are NOT ours to outlive: PracticeCommands starts them on
+            // GameManager, not on MaxPracticeManager, so destroying our own GameObject
+            // above leaves them running and they keep spawning and firing pucks with the
+            // mod off for the rest of their duration. The static dictionaries survive too
+            // (UnloadAssembly does not really unload us), so a stale entry would make the
+            // player's next /saveprac or /tipprac read as "stop" on a re-enable inside
+            // that window.
+            try
+            {
+                var gm = NetworkBehaviourSingleton<GameManager>.Instance;
+                if (gm != null)
+                {
+                    foreach (var kv in ActiveShooterSessions) gm.StopCoroutine(kv.Value);
+                    foreach (var kv in ActiveTipPracSessions) gm.StopCoroutine(kv.Value);
+                }
+                ActiveShooterSessions.Clear();
+                ActiveTipPracSessions.Clear();
+
+                // Stopping a routine mid-flight skips its own tail, and CleanupSessionPucks
+                // in that tail is the only thing that clears the pucks it put on the ice.
+                // Same destroy-and-clear PracticeManager.CleanupWarmupFeatures does, for the
+                // same reason: SpawnedPucks is static and survives the "unload", so a stale
+                // list would be walked by the next session's puck sweep and counted as goals
+                // against before a single new shot was taken.
+                // Unity's != , never ?. : a puck the goal detector already despawned is a
+                // normal transient state of this list (CheckAndCleanupPucks reaps them on a
+                // 0.5 s tick and counts them as goals), and ?. is a plain reference test that
+                // bypasses UnityEngine.Object's overloaded == - so it would read .gameObject
+                // on the destroyed puck, throw MissingReferenceException past the block catch,
+                // and skip the Clear() this exists for.
+                foreach (var kv in SpawnedPucks)
+                {
+                    foreach (var p in kv.Value)
+                    {
+                        if (p != null && p.gameObject != null)
+                            try { UnityEngine.Object.Destroy(p.gameObject); } catch { }
+                    }
+                }
+                SpawnedPucks.Clear();
+            }
+            catch { }
+
             harmony.UnpatchSelf();
             ConfigManager.Log("Disabled");
             return true;
@@ -294,6 +499,60 @@ public class MaxPracticePlugin : IPuckPlugin
     /// Clean up traffic/passers owned by a specific player (call on disconnect or position leave)
     /// Also respawns a puck for the player if they're still connected
     /// </summary>
+    /// <summary>
+    /// Remove every prop a player put on the ice - cones, minefield, their puck
+    /// shooter and their mini net - and reset the per-command use counters so they
+    /// get a clean slate next time they step on.
+    ///
+    /// Called from the same places traffic cleanup is: leaving a position, and
+    /// disconnecting. Props used to outlive the player who spawned them, which on a
+    /// busy practice server means the rink slowly fills with other people's cones.
+    /// </summary>
+    public static void CleanupPlayerProps(ulong steamId)
+    {
+        int removed = 0;
+
+        try
+        {
+            // The shooter and the mini net are handle pucks too, tracked under the
+            // same key, so this covers all four kinds in one pass.
+            if (HandlePucks.TryGetValue(steamId, out var pucks) && pucks != null)
+            {
+                foreach (var puck in pucks)
+                {
+                    if (puck == null) continue;
+                    PropPucks.Remove(puck);
+                    try
+                    {
+                        if (puck.gameObject != null) UnityEngine.Object.Destroy(puck.gameObject);
+                        removed++;
+                    }
+                    catch { }
+                }
+                pucks.Clear();
+                HandlePucks.Remove(steamId);
+            }
+
+            PlayerShooter.Remove(steamId);
+            PlayerMiniNet.Remove(steamId);
+
+            // Use counters, so /cones and /minefield are available again.
+            HandleUseCount.Remove(steamId);
+            MinefieldUseCount.Remove(steamId);
+
+            // The shooter is the pass position made visible; drop both together.
+            try { MaxPractice.YoyoManager.PlayerPassSettings.Remove(steamId); }
+            catch { }
+
+            if (removed > 0)
+                ConfigManager.Log($"Cleared {removed} prop(s) for player {steamId} leaving the ice");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[MaxPractice] CleanupPlayerProps failed: " + e.Message);
+        }
+    }
+
     public static void CleanupPlayerTraffic(ulong steamId)
     {
         if (!PlayerOwnedTraffic.TryGetValue(steamId, out var ownedTraffic))
@@ -495,7 +754,7 @@ public class MaxPracticePlugin : IPuckPlugin
             if (PracticeHelpers.GetPlayerRole(player) != PlayerRole.Goalie)
             {
                 ConfigManager.Dbg($"ShooterRoutine ended - player {steamId} is no longer goalie");
-                PracticeHelpers.SendMessageToPlayer(steamId, "<size=70%><color=#FF6666>Save practice stopped - you're no longer a goalie!</color></size>");
+                PracticeHelpers.SendMessageToPlayer(steamId, "<size=70%><color=#FF6666>Save practice stopped. You're no longer a goalie.</color></size>");
                 break;
             }
             
@@ -705,10 +964,10 @@ public class MaxPracticePlugin : IPuckPlugin
         float endTime = Time.time + ConfigManager.Config.SavePracDurationSeconds;
         bool isRedGoal = targetGoalPos.z < 0;
         float goalZ = targetGoalPos.z;
-        const float rinkXMin = -26.0f;
-        const float rinkXMax = 26.0f;
-        const float rinkZMin = -42.0f;
-        const float rinkZMax = 42.0f;
+        // Measured off the live arena so a resized rink (CompetitiveAdjustments) and the
+        // practice sheets both land inside their own boards.
+        float rinkXMin, rinkXMax, rinkZMin, rinkZMax;
+        MaxPractice.RinkSheets.IceBoundsAt(targetGoalPos, out rinkXMin, out rinkXMax, out rinkZMin, out rinkZMax);
         
         if (!SpawnedPucks.ContainsKey(steamId))
             SpawnedPucks[steamId] = new List<Puck>();

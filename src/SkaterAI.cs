@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -101,6 +101,10 @@ namespace MaxPractice
             IsRecording = false;
         }
         
+        // Playback cursor - see GetFrameAtTime.
+        private int _cursor;
+        private float _cursorTime = -1f;
+
         public SkaterFrame GetFrameAtTime(float time)
         {
             if (Frames.Count == 0) return default;
@@ -110,10 +114,23 @@ namespace MaxPractice
             float loopedTime = time % Duration;
             
             // Find the two frames to interpolate between
-            for (int i = 0; i < Frames.Count - 1; i++)
+            // Resume from where the last lookup finished instead of rescanning from 0.
+            //
+            // Playback time is monotonic apart from the loop wrap, so the answer is almost
+            // always the current segment or the next one. Scanning from index 0 every call
+            // was costly in a way that is easy to miss: List<SkaterFrame>'s indexer returns
+            // the struct BY VALUE - a ~92-byte copy per read, two reads per iteration - so a
+            // 600-frame clip averaged ~300 iterations and ~75 KB of pure copying, 30 times a
+            // second, per traffic dummy, whether or not anyone was watching.
+            if (loopedTime < _cursorTime) _cursor = 0;   // wrapped back to the clip start
+            _cursorTime = loopedTime;
+            if (_cursor > Frames.Count - 2) _cursor = 0;
+
+            for (int i = _cursor; i < Frames.Count - 1; i++)
             {
                 if (loopedTime >= Frames[i].Time && loopedTime < Frames[i + 1].Time)
                 {
+                    _cursor = i;
                     float t = (loopedTime - Frames[i].Time) / (Frames[i + 1].Time - Frames[i].Time);
                     return LerpFrame(Frames[i], Frames[i + 1], t);
                 }
@@ -356,6 +373,14 @@ namespace MaxPractice
                 
                 if (!SkaterPlayer.IsSpawned) return;
                 if (!MaxPracticePlugin.FakePlayers.Contains(SkaterPlayer)) { Destroy(this); return; }
+
+                // Traffic and passers have no sanctioned reason to exist outside warmup -
+                // unlike AI goalies, which persist by config or by a passed /votegoalies.
+                // The FakePlayers check above is the primary sweep and normally fires first,
+                // but it depends on ClearAllAISkaters having run; this does not. Going inert
+                // rather than self-destructing leaves the body where it is for the despawn to
+                // collect, instead of a passer that keeps stealing and re-firing the live puck.
+                if (!PracticeHelpers.IsWarmup) return;
                 
                 // Periodic physics reset to counteract CompetitivePuckTweaks (every ~0.5s)
                 _physicsResetCounter++;
@@ -581,6 +606,11 @@ namespace MaxPractice
             catch (Exception) { }
         }
         
+        // Last blade angle actually replicated - see the send site in the aiming code.
+        private sbyte _sentBladeAngle;
+        private bool _sentBladeAngleValid;
+        private int _bladeLastClientCount = -1;
+
         // Handedness tracking
         private PlayerHandedness _currentHandedness = PlayerHandedness.Right;
         private float _lastHandednessSwitch = 0f;
@@ -609,37 +639,43 @@ namespace MaxPractice
             Vector3 closestVel = Vector3.zero;
             Vector3 bodyPos = _body.transform.position;
             
-            // Find closest puck that was last touched by TargetPlayer
+            // Find closest puck that was last touched by TargetPlayer.
+            //
+            // Distance is tested BEFORE ownership. GetPlayerCollisions is the expensive half -
+            // it walks the puck's touch history and this mod's own postfix filters fake players
+            // out of the result - and it used to be asked of every puck on the ice on every AI
+            // tick, including pucks behind the far net that could never win. The two cheap
+            // rejections below (further than the best so far, or out of chase range entirely)
+            // now come first, so on a rink littered with practice pucks only a couple of
+            // candidates ever get the expensive question.
+            //
+            // Same answer as before: a puck that is closest but out of range used to be picked
+            // and then rejected by the MaxChaseRange test below; now it is never picked, and
+            // closestPuck stays null, which that test treats identically.
+            float maxChaseRangeSqr = MaxChaseRange * MaxChaseRange;   // tunable field, not a const
+
             foreach (var puck in pucks)
             {
                 if (puck == null) continue;
-                
+
+                Vector3 diff = puck.transform.position - bodyPos;
+                float distSqr = diff.sqrMagnitude;
+
+                if (distSqr >= closestDistSqr) continue;
+                if (distSqr > maxChaseRangeSqr) continue;
+
                 // Check if this puck was last touched by our TargetPlayer
                 if (TargetPlayer != null)
                 {
                     var collisions = puck.GetPlayerCollisions();
-                    if (collisions.Count > 0)
-                    {
-                        var lastToucher = collisions[collisions.Count - 1].Key;
-                        if (lastToucher != TargetPlayer)
-                            continue; // Skip pucks not from our target player
-                    }
-                    else
-                    {
-                        continue; // No collision history - skip
-                    }
+                    if (collisions.Count == 0) continue;   // No collision history - skip
+                    if (collisions[collisions.Count - 1].Key != TargetPlayer) continue;
                 }
-                
-                Vector3 diff = puck.transform.position - bodyPos;
-                float distSqr = diff.sqrMagnitude;
-                
-                if (distSqr < closestDistSqr)
-                {
-                    closestDistSqr = distSqr;
-                    closestPuck = puck;
-                    var rb = puck.GetComponent<Rigidbody>();
-                    closestVel = (rb != null) ? rb.linearVelocity : Vector3.zero;
-                }
+
+                closestDistSqr = distSqr;
+                closestPuck = puck;
+                var rb = puck.GetComponent<Rigidbody>();
+                closestVel = (rb != null) ? rb.linearVelocity : Vector3.zero;
             }
             
             float closestDist = closestPuck != null ? Mathf.Sqrt(closestDistSqr) : float.MaxValue;
@@ -945,7 +981,27 @@ namespace MaxPractice
                 try 
                 { 
                     _playerInput.BladeAngleInput.ServerValue = bladeAngle;
-                    _playerInput.Server_BladeAngleInputRpc(bladeAngle, _playerInput.RpcTarget.NotServer);
+
+                    // Only when it moved. bladeAngle is an sbyte clamped to [-4, 4] and only
+                    // changes when the passer re-aims, but this fired on every AI tick - a
+                    // reliable RPC to every client, per passer, for as long as one was on the
+                    // ice. The ServerValue write above stays unconditional; it is local.
+                    //
+                    // Reset on a client joining, because RpcTarget.NotServer only reaches
+                    // whoever is connected when it is sent: without this, a player who joined
+                    // after the last change would see the blade flat until it next moved.
+                    var nmBlade = NetworkManager.Singleton;
+                    int clientCount = (nmBlade != null && nmBlade.ConnectedClientsIds != null)
+                        ? nmBlade.ConnectedClientsIds.Count : 0;
+                    if (clientCount > _bladeLastClientCount) _sentBladeAngleValid = false;
+                    _bladeLastClientCount = clientCount;
+
+                    if (!_sentBladeAngleValid || _sentBladeAngle != bladeAngle)
+                    {
+                        _sentBladeAngle = bladeAngle;
+                        _sentBladeAngleValid = true;
+                        _playerInput.Server_BladeAngleInputRpc(bladeAngle, _playerInput.RpcTarget.NotServer);
+                    }
                 } 
                 catch (Exception) { }
                 
@@ -995,7 +1051,18 @@ namespace MaxPractice
         {
             // 5 second delay
             yield return new WaitForSeconds(3f);
-            
+
+            // Warmup can end inside those three seconds - /traffic typed as the clock runs
+            // out lands the dummy in the faceoff. Worse, PracticeManager.CleanupWarmupFeatures
+            // has already run by then, so nothing sweeps it back up and a fake skater plays
+            // out the period. The command's own gate can't cover this; only re-asking can.
+            if (!PracticeHelpers.IsWarmup)
+            {
+                PracticeHelpers.SendChatMessage(ui,
+                    "<size=70%>Warmup ended before the traffic dummy spawned.</size>", clientId);
+                yield break;
+            }
+
             var playerManager = MonoBehaviourSingleton<PlayerManager>.Instance;
             if (playerManager == null) yield break;
             
@@ -1007,7 +1074,17 @@ namespace MaxPractice
             
             // Re-check limit after delay using config
             int maxPerTeam = MaxPractice.ConfigManager.Config.TrafficPerPlayer;
-            if (teamList.Count >= maxPerTeam) yield break;
+            // TrafficPerPlayer is enforced per TEAM, not per player, and the caller has
+            // already replied "Traffic spawn queued". Bailing silently left the second
+            // player on a team waiting three seconds for a dummy that was never coming,
+            // with no explanation and a /cleartraffic that then reported zero.
+            if (teamList.Count >= maxPerTeam)
+            {
+                PracticeHelpers.SendChatMessage(ui,
+                    $"<size=70%>Traffic limit reached for this team ({teamList.Count}/{maxPerTeam}). The limit is " +
+                    "shared, so someone else's dummy is already using the slot.</size>", clientId);
+                yield break;
+            }
             
             // Get unique traffic number (persists across clears for consistent naming)
             int uniqueTrafficNum = _nextTrafficNumber++;
@@ -1037,7 +1114,7 @@ namespace MaxPractice
                 {
                     var firstFrame = recording.Frames[0];
                     spawnPos = firstFrame.BodyPosition;
-                    spawnPos.y = 0f;
+                    spawnPos.y = MaxPractice.RinkSheets.IceHeightAt(spawnPos, 0f);
                     spawnRot = firstFrame.BodyRotation;
                 }
                 
@@ -1101,7 +1178,11 @@ namespace MaxPractice
         {
             // 3 second delay for passer
             yield return new WaitForSeconds(3f);
-            
+
+            // Same reason as SpawnTrafficDelayed above: the phase can turn over inside the
+            // wait, and a passer that lands after CleanupWarmupFeatures is never collected.
+            if (!PracticeHelpers.IsWarmup) yield break;
+
             var playerManager = MonoBehaviourSingleton<PlayerManager>.Instance;
             if (playerManager == null) yield break;
             
@@ -1285,6 +1366,10 @@ namespace MaxPractice
         /// <summary>
         /// Playback recorded movement in a loop
         /// </summary>
+        /// <summary>Shared by every playback loop - WaitForSeconds is immutable and re-yielding
+        /// the same instance simply restarts the wait.</summary>
+        private static readonly WaitForSeconds playbackFrameWait = new WaitForSeconds(0.033f);
+
         public static IEnumerator PlaybackRecording(Player trafficPlayer, SkaterRecording recording)
         {
             yield return null;
@@ -1339,6 +1424,12 @@ namespace MaxPractice
                 yield break;
             }
             
+            // Per-coroutine, NOT static: PlaybackRecording runs once per traffic dummy and
+            // they all tick concurrently at 30 Hz, so a shared field let one dummy's angle
+            // suppress another dummy's genuinely-needed broadcast. sbyte.MinValue = nothing
+            // sent yet, so the first tick always transmits.
+            sbyte lastBroadcastBladeAngle = sbyte.MinValue;
+
             float playbackStartTime = Time.time;
             
             while (true)
@@ -1385,7 +1476,14 @@ namespace MaxPractice
                         // Apply blade angle using reflection AND broadcast via RPC for clients
                         try
                         {
-                            var rotationContainerField = typeof(Stick).GetField("rotationContainer", BindingFlags.NonPublic | BindingFlags.Instance);
+                            // Reuse the cached FieldInfo. This is a 30 Hz loop per dummy and
+                            // typeof(Stick).GetField is a name lookup over Stick's field
+                            // table every time; the passer path already caches it.
+                            if (_rotationContainerField == null)
+                            {
+                                _rotationContainerField = typeof(Stick).GetField("rotationContainer", BindingFlags.NonPublic | BindingFlags.Instance);
+                            }
+                            var rotationContainerField = _rotationContainerField;
                             if (rotationContainerField != null)
                             {
                                 var rotationContainer = rotationContainerField.GetValue(trafficPlayer.Stick) as GameObject;
@@ -1396,11 +1494,19 @@ namespace MaxPractice
                                 }
                             }
                             
-                            // Broadcast blade angle to clients via RPC
+                            // Broadcast the blade angle only when it CHANGES. Recorded
+                            // angles are sbytes in [-4,4] that move a handful of times in a
+                            // 20 s clip, and this fires 30 times a second per dummy, fanned
+                            // out to every connected client - almost all of it re-sending a
+                            // value the clients already had.
                             if (trafficPlayer.PlayerInput != null)
                             {
                                 trafficPlayer.PlayerInput.BladeAngleInput.ServerValue = frame.BladeAngle;
-                                trafficPlayer.PlayerInput.Server_BladeAngleInputRpc(frame.BladeAngle, trafficPlayer.PlayerInput.RpcTarget.NotServer);
+                                if (frame.BladeAngle != lastBroadcastBladeAngle)
+                                {
+                                    lastBroadcastBladeAngle = frame.BladeAngle;
+                                    trafficPlayer.PlayerInput.Server_BladeAngleInputRpc(frame.BladeAngle, trafficPlayer.PlayerInput.RpcTarget.NotServer);
+                                }
                             }
                         }
                         catch (Exception) { }
@@ -1412,8 +1518,11 @@ namespace MaxPractice
                     yield break;
                 }
                 
-                // Run at ~30fps instead of every frame to reduce CPU load
-                yield return new WaitForSeconds(0.033f);
+                // Run at ~30fps instead of every frame to reduce CPU load. One reused
+                // WaitForSeconds rather than a fresh one per frame: playback loops for as long
+                // as the traffic dummy is on the ice, so this was 30 throwaway objects a
+                // second per dummy.
+                yield return playbackFrameWait;
             }
         }
         
@@ -1425,9 +1534,41 @@ namespace MaxPractice
             // Get framerate from config
             float fps = MaxPractice.PracticeConstants.TrafficRecordingFps;
             float frameDelay = fps > 0 ? 1f / fps : 0.033f;
-            
+
+            // One instance for the whole recording. TrafficRecordingFps is 120, so the old
+            // `yield return new WaitForSeconds(frameDelay)` at the bottom of this loop minted
+            // 120 throwaway objects a second for as long as anyone was recording. WaitForSeconds
+            // is immutable and re-yielding the same instance restarts its wait, which is the
+            // standard way to write this.
+            var frameWait = new WaitForSeconds(frameDelay);
+
             while (ActiveRecordings.ContainsKey(steamId))
             {
+                // Recording is a warmup tool with a 20 s cap and no phase check of its own, so
+                // a /recordtraffic started near the end of warmup went on sampling the player's
+                // live-play movement at 120 Hz and then announced "Recording auto-stopped" in
+                // the middle of a shift. Drop the partial recording rather than completing it:
+                // half of it is gameplay the player never meant to capture. CleanupWarmupFeatures
+                // clears ActiveRecordings too, which ends this loop the same way - this check
+                // just makes it immediate.
+                if (!PracticeHelpers.IsWarmup)
+                {
+                    ActiveRecordings.Remove(steamId);
+                    PracticeHelpers.SendChatMessage(ui,
+                        "<size=70%><color=#FFA500FF>Warmup ended - recording discarded.</color></size>", clientId);
+                    yield break;
+                }
+
+                // The recorder holds a Player reference for the whole 20 s. Nothing on the
+                // disconnect path clears ActiveRecordings, so a player who quit or was
+                // despawned mid-recording left this loop sampling a dead reference 120 times a
+                // second until the duration cap ran out.
+                if (player == null)
+                {
+                    ActiveRecordings.Remove(steamId);
+                    yield break;
+                }
+
                 var recording = ActiveRecordings[steamId];
                 if (recording != null && recording.IsRecording)
                 {
@@ -1450,10 +1591,35 @@ namespace MaxPractice
                     break;
                 }
                 
-                yield return new WaitForSeconds(frameDelay);
+                yield return frameWait;
             }
         }
         
+        /// <summary>
+        /// Drop a departing player's recordings.
+        ///
+        /// A SkaterRecording holds one frame per player per 1/120 s for up to 20 seconds -
+        /// call it a couple of hundred kilobytes - and CompletedRecordings was keyed by player
+        /// and never pruned. CleanupPlayerTraffic looked like the place this happened, but it
+        /// returns early for anyone who never spawned a dummy, which is exactly the player who
+        /// recorded a clip and then left. On a long-running server that accumulated for every
+        /// visitor who ever typed /recordtraffic.
+        ///
+        /// Both keys, for the same reason the other per-player cleanups take both: an entry may
+        /// have been written under OwnerClientId or under SteamId depending on what
+        /// GetSteamIdFromPlayer resolved to at the time.
+        /// </summary>
+        public static void ForgetRecordings(ulong steamId, ulong clientId)
+        {
+            ActiveRecordings.Remove(steamId);
+            CompletedRecordings.Remove(steamId);
+            if (clientId != steamId)
+            {
+                ActiveRecordings.Remove(clientId);
+                CompletedRecordings.Remove(clientId);
+            }
+        }
+
         /// <summary>
         /// Clear all AI skaters
         /// </summary>
@@ -1506,6 +1672,22 @@ namespace MaxPractice
         /// <summary>
         /// Clear a specific traffic by number
         /// </summary>
+        /// <summary>
+        /// Is traffic <paramref name="number"/> one of <paramref name="steamId"/>'s?
+        ///
+        /// TrafficByNumber is global and its numbers are a plain incrementing counter, so
+        /// the numbered clear needs this to enforce the same ownership rule the bare
+        /// /cleartraffic already applies through PlayerOwnedTraffic.
+        /// </summary>
+        public static bool IsTrafficOwnedBy(int number, ulong steamId)
+        {
+            if (!TrafficByNumber.TryGetValue(number, out Player traffic) || traffic == null)
+                return false;
+
+            return MaxPracticePlugin.PlayerOwnedTraffic.TryGetValue(steamId, out var owned)
+                   && owned != null && owned.Contains(traffic);
+        }
+
         public static bool ClearTrafficByNumber(int number)
         {
             if (!TrafficByNumber.TryGetValue(number, out Player traffic))

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using UnityEngine;
 using System.Collections.Generic;
 using System.Reflection;
@@ -36,6 +36,71 @@ namespace MaxPractice
         
         // Tap backpass enabled per player (clientId -> enabled) - spawns backpass on tap
         public static HashSet<ulong> TapBackpassPlayers = new HashSet<ulong>();
+
+        // Players whose YoyoPlayers entry was added BY /tapyoyo rather than by /yoyo, so
+        // leaving tap yoyo can undo exactly what it turned on and no more.
+        private static readonly HashSet<ulong> _implicitYoyo = new HashSet<ulong>();
+
+        /// <summary>Turn on plain yoyo tracking on tap yoyo's behalf.</summary>
+        public static void AcquireImplicitYoyo(ulong steamId)
+        {
+            if (MaxPracticePlugin.YoyoPlayers.Add(steamId))
+                _implicitYoyo.Add(steamId);
+        }
+
+        /// <summary>
+        /// Undo <see cref="AcquireImplicitYoyo"/>. A no-op when the player had /yoyo on in
+        /// their own right - tearing that down was never tap yoyo's to do.
+        /// </summary>
+        public static void ReleaseImplicitYoyo(ulong steamId)
+        {
+            if (_implicitYoyo.Remove(steamId))
+                MaxPracticePlugin.YoyoPlayers.Remove(steamId);
+        }
+
+        /// <summary>
+        /// Turn plain yoyo on or off because the player asked for it directly, and take the
+        /// implicit claim off it either way.
+        ///
+        /// /yoyo used to add to and remove from YoyoPlayers itself, which left the ownership
+        /// record lying: turn on /tapyoyo (which acquires an implicit entry), then toggle /yoyo
+        /// twice, and the player now holds yoyo in their own right while _implicitYoyo still
+        /// says tap yoyo put it there. The next /tapyoyo off then silently took away the yoyo
+        /// they had explicitly asked for. An explicit toggle is the player speaking for
+        /// themselves, so it always ends the implicit claim.
+        /// </summary>
+        /// <returns>true if yoyo is now on for this player.</returns>
+        public static bool SetExplicitYoyo(ulong steamId, bool on)
+        {
+            _implicitYoyo.Remove(steamId);
+
+            if (on) MaxPracticePlugin.YoyoPlayers.Add(steamId);
+            else MaxPracticePlugin.YoyoPlayers.Remove(steamId);
+
+            return on;
+        }
+
+        /// <summary>
+        /// Drop every per-player yoyo, pass and tap setting.
+        ///
+        /// All of these are warmup-only tools, and several of them point at something the
+        /// warmup exit destroys - PlayerPassSettings and PlayerTapPassSettings reference a
+        /// shooter prop that CleanupWarmupFeatures has already torn down, so keeping them
+        /// carried a dangling intent into the next warmup while the prop it named was gone.
+        /// Clearing them makes the mod's per-player state match its per-player objects.
+        /// </summary>
+        public static void ResetAllPlayerState()
+        {
+            MaxPracticePlugin.YoyoPlayers.Clear();
+            _implicitYoyo.Clear();
+
+            PlayerPassSettings.Clear();
+            PlayerTapPassSettings.Clear();
+            TapSpawnPlayers.Clear();
+            TapYoyoPlayers.Clear();
+            TapBackpassPlayers.Clear();
+            LastTouchedPuck.Clear();
+        }
         
         // Stick tap detection state per player
         private Dictionary<ulong, StickTapTracker> playerStickTapTrackers = new Dictionary<ulong, StickTapTracker>();
@@ -147,6 +212,7 @@ namespace MaxPractice
         private List<ulong> _toRemoveCache = new List<ulong>();
         private List<ulong> _ownerCache = new List<ulong>();
         private List<ulong> _detachCache = new List<ulong>();
+        private readonly HashSet<ulong> _tapPlayerCache = new HashSet<ulong>();
         
         void Update()
         {
@@ -190,8 +256,13 @@ namespace MaxPractice
         /// </summary>
         private void UpdateStickTapDetection()
         {
-            // Build set of all players who need tap detection
-            var allTapPlayers = new HashSet<ulong>();
+            // Reused, not allocated. This runs at 60 Hz for the whole of Warmup - above
+            // the "no yoyo players" early-out - and the old `new HashSet<ulong>()` was built
+            // BEFORE the "nothing to do" bail below, so it produced 60 throwaway sets a
+            // second even on a server where no tap command was in use. The file already uses
+            // reusable caches for exactly this (_toRemoveCache and friends).
+            var allTapPlayers = _tapPlayerCache;
+            allTapPlayers.Clear();
             foreach (var kvp in PlayerTapPassSettings) allTapPlayers.Add(kvp.Key);
             foreach (var id in TapSpawnPlayers) allTapPlayers.Add(id);
             foreach (var id in TapYoyoPlayers) allTapPlayers.Add(id);
@@ -338,44 +409,27 @@ namespace MaxPractice
         }
         
         /// <summary>
-        /// Spawn a pass from tap pass settings (called from UpdateStickTapDetection)
+        /// Fire a tap-triggered pass.
+        ///
+        /// Hands straight over to SpawnPass, the same routine /pass uses, rather than
+        /// keeping a second implementation. That one swings the shooter round to face
+        /// where the pass is going and fires from its muzzle; this one used to spawn the
+        /// puck at a bare position instead, so a tap pass came out of thin air slightly
+        /// beside the machine that was supposedly throwing it - and drifted apart from
+        /// /pass every time either was touched.
         /// </summary>
         private static bool SpawnTapPass(ulong clientId, TapPassSettings settings, Player player)
         {
             if (!NetworkManager.Singleton.IsServer) return false;
             if (player == null || player.Stick == null) return false;
-            
-            Vector3 bladePos = player.Stick.BladeHandlePosition;
-            float distance = Vector3.Distance(settings.PassFromPosition, bladePos);
-            
-            // Don't pass if too close
+
+            // Still worth refusing a pass from under the player's own feet.
+            float distance = Vector3.Distance(settings.PassFromPosition, player.Stick.BladeHandlePosition);
             if (distance < 2f) return false;
-            
-            Vector3 spawnPos = settings.PassFromPosition;
-            spawnPos.y = 0.05f;
-            
-            // Use ballistic arc so pass has proper air/lift
-            Vector3 velocity;
-            if (Instance != null)
-            {
-                Vector3? ballisticVel = Instance.CalculateBallisticVelocityPublic(spawnPos, bladePos, settings.Speed, false);
-                velocity = ballisticVel ?? (bladePos - spawnPos).normalized * settings.Speed;
-            }
-            else
-            {
-                velocity = (bladePos - spawnPos).normalized * settings.Speed;
-            }
-            
-            var puck = PracticeHelpers.SpawnPuckWithCleanup(spawnPos, Quaternion.identity, velocity, false);
-            if (puck != null)
-            {
-                RegisterPuckForPlayer(puck, player);
-                MaxPracticePlugin.LastPuckSpawnTime[clientId] = Time.realtimeSinceStartup;
-                return true;
-            }
-            return false;
+
+            return SpawnPass(clientId);
         }
-        
+
         /// <summary>
         /// Spawn a puck above stick (like /spawnpuck but triggered by tap)
         /// </summary>
@@ -419,10 +473,14 @@ namespace MaxPractice
             
             if (puck == null || puck.Rigidbody == null)
             {
+                // Drop the returning flag with it. The key is the Puck reference, so an
+                // entry left behind here is never reachable again and just grows the
+                // dictionary for the life of the process.
+                if (!ReferenceEquals(puck, null)) puckReturning.Remove(puck);
                 playerYoyoPucks.Remove(clientId);
                 return false;
             }
-            
+
             // Check if already returning
             if (puckReturning.TryGetValue(puck, out bool isReturning) && isReturning)
                 return false;
@@ -456,7 +514,7 @@ namespace MaxPractice
             
             // Spawn puck behind player using config distance
             Vector3 behindPlayer = playerBody.transform.position - playerBody.transform.forward * PracticeConstants.BackpassDistance;
-            behindPlayer.y = 0.05f; // Just above ice
+            behindPlayer.y = RinkSheets.IceHeightAt(behindPlayer, 0.05f); // Just above ice
             
             // Clamp spawn position to stay within actual ice bounds
             /* B310: LevelManager was restructured - bounds clamping disabled
@@ -534,10 +592,8 @@ namespace MaxPractice
                 ulong steamId = kvp.Key;
                 Puck puck = kvp.Value;
                 
-                // Skip yank detection for players using tapyoyo (they use taps instead)
-                if (TapYoyoPlayers.Contains(steamId))
-                    continue;
-                
+                bool usesTapYoyo = TapYoyoPlayers.Contains(steamId);
+
                 // Check if puck still exists
                 if (puck == null || puck.Rigidbody == null)
                 {
@@ -553,7 +609,14 @@ namespace MaxPractice
                     continue;
                 }
                 
-                // Check if puck is currently returning (skip yank detection while returning)
+                // Check if puck is currently returning (skip yank detection while returning).
+                //
+                // This has to run for tap-yoyo players too, which is why the tap-yoyo skip
+                // below sits AFTER it rather than at the top of the loop. TriggerTapYoyo
+                // latches the same puckReturning flag on, and this block is the only thing
+                // that ever clears it - so skipping tap players here left the flag stuck on
+                // after the first return that did not land, and TriggerTapYoyo's own
+                // "already returning" guard then refused every future tap for that puck.
                 if (puckReturning.TryGetValue(puck, out bool isReturning) && isReturning)
                 {
                     // Check if puck reached player (stop returning state)
@@ -564,7 +627,12 @@ namespace MaxPractice
                     }
                     continue;
                 }
-                
+
+                // Tap-yoyo players return the puck by tapping the ice, not by yanking the
+                // stick, so everything past here is not theirs.
+                if (usesTapYoyo)
+                    continue;
+
                 // Check yank cooldown
                 if (lastYankTime.TryGetValue(steamId, out float lastYank))
                 {
@@ -768,7 +836,7 @@ namespace MaxPractice
                 return player.Stick.BladeHandlePosition;
             }
             Vector3 pos = player.transform.position;
-            pos.y = 0.08f;
+            pos.y = RinkSheets.IceHeightAt(pos, 0.08f);
             return pos;
         }
         
@@ -876,6 +944,14 @@ namespace MaxPractice
             
             Vector3 startPos = settings.PassFromPosition;
             Vector3 targetPos = Instance.PredictStickPosition(player);
+
+            // Swing the shooter round so it's pointing where this pass is going,
+            // then fire from its muzzle. Aiming first matters: the muzzle sits on
+            // the shooter's pivot, but reading it before the turn would still be a
+            // frame behind on the y/z the barrel ends up at.
+            PracticeHelpers.AimShooter(steamId, targetPos);
+            if (PracticeHelpers.TryGetMuzzle(steamId, out Vector3 muzzle))
+                startPos = muzzle;
             
             var pm = MonoBehaviourSingleton<PuckManager>.Instance;
             if (pm == null) return false;
@@ -986,6 +1062,28 @@ namespace MaxPractice
             catch { return null; }
         }
         
+        /// <summary>
+        /// Snapshot of who currently has a puck on their string, for YoyoStringNetwork.
+        ///
+        /// A snapshot the network layer polls, rather than an event every writer has to
+        /// remember to raise: playerYoyoPucks is written from touches, yanks, detaches,
+        /// disconnects and phase cleanup, and a poll cannot miss one of them.
+        /// </summary>
+        public static void CollectActivePairs(List<KeyValuePair<ulong, Puck>> into)
+        {
+            if (into == null) return;
+            into.Clear();
+
+            var self = Instance;
+            if (self == null) return;
+
+            foreach (var kv in self.playerYoyoPucks)
+            {
+                if (kv.Value == null) continue;
+                into.Add(kv);
+            }
+        }
+
         public void CleanupAll()
         {
             playerYoyoPucks.Clear();
@@ -1006,13 +1104,16 @@ namespace MaxPractice
             CleanupKey(steamId);
             if (clientId != steamId) CleanupKey(clientId);
 
-            // Also static dicts.
+            // Also static dicts. _implicitYoyo was missing from this list, so a player who
+            // disconnected with /tapyoyo on left an entry behind for the life of the server.
             LastTouchedPuck.Remove(steamId);
             PlayerPassSettings.Remove(steamId);
+            PracticeHelpers.ClearShooter(steamId);
             PlayerTapPassSettings.Remove(steamId);
             TapSpawnPlayers.Remove(steamId);
             TapYoyoPlayers.Remove(steamId);
             TapBackpassPlayers.Remove(steamId);
+            _implicitYoyo.Remove(steamId);
             if (clientId != steamId)
             {
                 LastTouchedPuck.Remove(clientId);
@@ -1021,6 +1122,7 @@ namespace MaxPractice
                 TapSpawnPlayers.Remove(clientId);
                 TapYoyoPlayers.Remove(clientId);
                 TapBackpassPlayers.Remove(clientId);
+                _implicitYoyo.Remove(clientId);
             }
         }
 

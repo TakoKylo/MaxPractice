@@ -1,4 +1,4 @@
-// GoalieAIManager.cs - AI goalie lifecycle, Harmony patches, and vote-driven enable/disable.
+﻿// GoalieAIManager.cs - AI goalie lifecycle, Harmony patches, and vote-driven enable/disable.
 // Adapted from ToastersRinkSuite reference for Puck B323 + MaxPractice integration.
 
 using System;
@@ -46,10 +46,6 @@ namespace MaxPractice
         // the replay recorder captures their movement.
         internal static bool bypassFilter;
 
-        // Hardcoded goal positions. B323 has no RandomGoalSpots; matches existing GoalieAI hardcoded values.
-        private static readonly Vector3 RedGoalPos = new Vector3(0f, 0f, -40.23f);
-        private static readonly Vector3 BlueGoalPos = new Vector3(0f, 0f, 40.23f);
-
         public static Player RedAIGoalie => MaxPracticePlugin.RedTeamDummy;
         public static Player BlueAIGoalie => MaxPracticePlugin.BlueTeamDummy;
 
@@ -65,16 +61,16 @@ namespace MaxPractice
         }
 
         /// <summary>
-        /// Compute crease spawn position + rotation for a team. Replaces reference's RandomGoalSpots.
+        /// Compute crease spawn position + rotation for a team. Replaces reference's
+        /// RandomGoalSpots. Measured off the live net (see GoalGeometry) so the goalie spawns
+        /// in its crease rather than at the vanilla goal line on a CompAdjust-resized rink.
         /// </summary>
         private static (Vector3 pos, Quaternion rot) GetCreasePosition(PlayerTeam team)
         {
             bool isRed = team == PlayerTeam.Red;
-            Vector3 goalPos = isRed ? RedGoalPos : BlueGoalPos;
-            Vector3 pos = goalPos;
+            Vector3 pos = GoalGeometry.Get(team);
             pos.z += isRed ? 1.2f : -1.2f;
             pos.y = 0f;
-            pos.x = 0f;
             Quaternion rot = Quaternion.LookRotation(isRed ? Vector3.forward : Vector3.back);
             return (pos, rot);
         }
@@ -106,7 +102,18 @@ namespace MaxPractice
             if (endOfGameDespawnTime > 0f && Time.time >= endOfGameDespawnTime)
             {
                 endOfGameDespawnTime = 0f;
-                DespawnAll();
+
+                // Only if the game is still over. This timer is set on GameOver and fires 11 s
+                // later to let the win/loss animation finish, but nothing said the phase had to
+                // still be GameOver when it lands. A server that resets quickly can be back in
+                // Warmup by then, and the timer would wipe the goalies that warmup had already
+                // spawned - including one someone had just asked for with /dummy. They come back
+                // on the next evaluation, so the symptom was goalies blinking out a few seconds
+                // into warmup for no visible reason.
+                var gmNow = NetworkBehaviourSingleton<GameManager>.Instance;
+                GamePhase phaseNow = gmNow != null ? gmNow.Phase : GamePhase.None;
+                if (phaseNow == GamePhase.GameOver || phaseNow == GamePhase.PostGame || phaseNow == GamePhase.None)
+                    DespawnAll();
             }
 
             if (!AutoEnabled) return;
@@ -131,8 +138,18 @@ namespace MaxPractice
 
             GamePhase phase = gm.Phase;
 
-            // Skip during GameOver/None/Replay. Replay despawns humans, which would trick us into spawning AI.
-            if (phase == GamePhase.GameOver || phase == GamePhase.None || phase == GamePhase.Replay)
+            // Skip during GameOver/PostGame/None/Replay. Replay despawns humans, which would
+            // trick us into spawning AI.
+            //
+            // PostGame belongs here for the same reason but was missing. GameOver defers its
+            // despawn by 11 s so the win/loss animation can play, and PostGame typically starts
+            // a second or two into that window - so this ran with isWarmup false, decided both
+            // empty goalie slots needed filling, and spawned a pair of AI goalies moments before
+            // the timer despawned them. Worse, once the timer had fired and cleared itself, the
+            // next evaluation spawned them straight back, giving a spawn/despawn cycle every
+            // EvalInterval for the whole of PostGame.
+            if (phase == GamePhase.GameOver || phase == GamePhase.PostGame ||
+                phase == GamePhase.None || phase == GamePhase.Replay)
                 return;
 
             bool hasHumanRedGoalie = false;
@@ -413,6 +430,11 @@ namespace MaxPractice
         /// </summary>
         public static void OnGameStateChanged(GamePhase oldPhase, GamePhase newPhase)
         {
+            // The nets can be respawned with the level across a phase change, and CompAdjust
+            // re-applies the arena resize on pregame. Drop the cached goal lines so the next
+            // read measures the nets that exist now instead of waiting out the poll interval.
+            GoalGeometry.Invalidate();
+
             // Goal-scored detection — trigger sad reaction on the team that got scored on.
             if (newPhase == GamePhase.BlueScore) OnGoalScored(PlayerTeam.Blue);
             else if (newPhase == GamePhase.RedScore) OnGoalScored(PlayerTeam.Red);
@@ -606,6 +628,53 @@ namespace MaxPractice
         }
 
         /// <summary>
+        /// Return <paramref name="source"/> with every MaxPractice fake player removed, or the
+        /// same list untouched when it holds none.
+        ///
+        /// Shared by the GetPlayers and GetSpawnedPlayers postfixes, which had the same body
+        /// written out twice. Both are called from the game's own per-frame and per-tick paths
+        /// (scoreboard, vote thresholds, pause logic), so the shape matters:
+        ///
+        ///  - It counts first and returns the original list when nothing needs dropping. That
+        ///    is the common case for GetSpawnedPlayers, and it was allocating a full copy for
+        ///    it anyway.
+        ///  - The copy, when one is needed, is sized exactly and built with an index loop.
+        ///    `.Where(...).ToList()` allocated a closure, an iterator and a list that then grew
+        ///    by doubling.
+        ///
+        /// What it must NOT do is filter in place. PlayerManager.GetPlayers returns its BACKING
+        /// LIST, not a copy, so removing from it deletes the fake player from the game's roster
+        /// permanently - RemoveStalePlayers/RebuildPlayerLists rebuild from that same list, so
+        /// nothing puts it back, and the bot vanishes from replays and from GetPlayerByClientId.
+        /// Allocating a new list is the price of filtering a collection we do not own.
+        ///
+        /// Membership is tested against the FakePlayers HashSet by reference rather than through
+        /// the broader clientId/username detector, because FakePlayers is populated AFTER the
+        /// spawn-time GetPlayerByClientId lookup the AI spawn flow depends on: a brand-new fake
+        /// has to slip through that one lookup, then be filtered from every call after it.
+        /// </summary>
+        private static List<Player> WithoutFakePlayers(List<Player> source)
+        {
+            if (source == null) return null;
+
+            var fakes = MaxPracticePlugin.FakePlayers;
+
+            int drop = 0;
+            for (int i = 0; i < source.Count; i++)
+                if (fakes.Contains(source[i])) drop++;
+
+            if (drop == 0) return source;
+
+            var filtered = new List<Player>(source.Count - drop);
+            for (int i = 0; i < source.Count; i++)
+            {
+                Player p = source[i];
+                if (!fakes.Contains(p)) filtered.Add(p);
+            }
+            return filtered;
+        }
+
+        /// <summary>
         /// Strip every kind of MaxPractice fake player (AI goalies, traffic dummies,
         /// passer AIs) from PlayerManager.GetPlayers(). The tab scoreboard, vote
         /// thresholds, pause logic, etc. all read this; if a traffic dummy slips
@@ -621,12 +690,7 @@ namespace MaxPractice
             {
                 if (bypassFilter) return;
                 if (MaxPracticePlugin.FakePlayers.Count == 0) return;
-                // Use the HashSet directly (reference equality) rather than the
-                // broader clientId/username detector — `FakePlayers` is populated
-                // AFTER the spawn-time GetPlayerByClientId lookup that AI spawn
-                // flows depend on, so brand-new fakes correctly slip through that
-                // single lookup, then get filtered from every subsequent call.
-                __result = __result.Where(p => !MaxPracticePlugin.FakePlayers.Contains(p)).ToList();
+                __result = WithoutFakePlayers(__result);
             }
         }
 
@@ -638,12 +702,7 @@ namespace MaxPractice
             {
                 if (bypassFilter) return;
                 if (MaxPracticePlugin.FakePlayers.Count == 0) return;
-                // Use the HashSet directly (reference equality) rather than the
-                // broader clientId/username detector — `FakePlayers` is populated
-                // AFTER the spawn-time GetPlayerByClientId lookup that AI spawn
-                // flows depend on, so brand-new fakes correctly slip through that
-                // single lookup, then get filtered from every subsequent call.
-                __result = __result.Where(p => !MaxPracticePlugin.FakePlayers.Contains(p)).ToList();
+                __result = WithoutFakePlayers(__result);
             }
         }
 
@@ -797,6 +856,36 @@ namespace MaxPractice
         }
 
         /// <summary>
+        /// The puck's last-touched list with every fake player's entry removed, or the same
+        /// list back when it holds none.
+        ///
+        /// Same shape and the same reasoning as <see cref="WithoutFakePlayers"/>: this sits on
+        /// a collision path, so it counts before it allocates and returns the original list
+        /// untouched in the common case where no dummy has touched the puck. The previous
+        /// `.Where(...).ToList()` rebuilt the list on every call that got past the
+        /// FakePlayers.Count gate, allocating a closure and an iterator with it.
+        /// </summary>
+        private static List<KeyValuePair<Player, float>> WithoutFakeTouches(List<KeyValuePair<Player, float>> source)
+        {
+            if (source == null) return null;
+
+            var fakes = MaxPracticePlugin.FakePlayers;
+
+            int drop = 0;
+            for (int i = 0; i < source.Count; i++)
+                if (fakes.Contains(source[i].Key)) drop++;
+
+            if (drop == 0) return source;
+
+            var filtered = new List<KeyValuePair<Player, float>>(source.Count - drop);
+            for (int i = 0; i < source.Count; i++)
+            {
+                if (!fakes.Contains(source[i].Key)) filtered.Add(source[i]);
+            }
+            return filtered;
+        }
+
+        /// <summary>
         /// Strip every fake player (goalies + traffic + passers) from the puck's
         /// last-touched list. Otherwise a traffic dummy bumping a puck would steal
         /// the "last touch" credit and break goal/assist attribution.
@@ -808,7 +897,7 @@ namespace MaxPractice
             public static void Postfix(ref List<KeyValuePair<Player, float>> __result)
             {
                 if (MaxPracticePlugin.FakePlayers.Count == 0) return;
-                __result = __result.Where(kvp => !MaxPracticePlugin.FakePlayers.Contains(kvp.Key)).ToList();
+                __result = WithoutFakeTouches(__result);
             }
         }
 
@@ -819,7 +908,7 @@ namespace MaxPractice
             public static void Postfix(ref List<KeyValuePair<Player, float>> __result)
             {
                 if (MaxPracticePlugin.FakePlayers.Count == 0) return;
-                __result = __result.Where(kvp => !MaxPracticePlugin.FakePlayers.Contains(kvp.Key)).ToList();
+                __result = WithoutFakeTouches(__result);
             }
         }
     }

@@ -135,6 +135,40 @@ namespace MaxPractice
 
         public static Dictionary<KeyChord, string> GetBindings() => _chordToCommand;
 
+        /// <summary>
+        /// Bind a chord to a command, taking it off whatever held it before, and save.
+        /// </summary>
+        /// <returns>The command that lost the chord, or null if it was free.</returns>
+        /// <remarks>
+        /// RebuildLookups folds commandBinds into the chord-&gt;command dictionary with a plain
+        /// assignment, so a chord bound twice silently resolved to whichever entry came last
+        /// while the menu kept drawing a chip on BOTH rows. The first bind was dead with no
+        /// indication of it. Displacing the previous owner here makes that visible instead.
+        /// </remarks>
+        public static string BindCommand(string command, string keySpec)
+        {
+            if (string.IsNullOrEmpty(command) || string.IsNullOrEmpty(keySpec)) return null;
+
+            string displaced = null;
+            if (TryParseChord(keySpec, out KeyChord incoming))
+            {
+                for (int i = Config.commandBinds.Count - 1; i >= 0; i--)
+                {
+                    if (!ParseCommandEntry(Config.commandBinds[i], out string cmd, out string spec)) continue;
+                    if (!TryParseChord(spec, out KeyChord existing)) continue;
+                    if (!existing.Equals(incoming)) continue;
+
+                    if (!string.Equals(cmd, command, StringComparison.OrdinalIgnoreCase))
+                        displaced = cmd;
+                    Config.commandBinds.RemoveAt(i);
+                }
+            }
+
+            Config.commandBinds.Add(command + ":" + keySpec);
+            SaveConfig();
+            return displaced;
+        }
+
         private static bool ParseCommandEntry(string raw, out string command, out string keySpec)
         {
             command = null; keySpec = null;
