@@ -200,6 +200,36 @@ namespace MaxPractice
         }
 
         private readonly List<ActionTile> _actionTiles = new List<ActionTile>();
+
+        // ------------------------------------------------------------------
+        // Search
+        //
+        // Same shape as the one in CompetitiveAdjustments' panel: a field under the tabs,
+        // every row tagged with the text it can be found by, and a filter pass that hides
+        // rows, then hides any section left with nothing in it.
+        //
+        // The index is rebuilt with the bodies on every open (ShowUI clears it first), so it
+        // never holds a VisualElement from a previous visit.
+        // ------------------------------------------------------------------
+        private sealed class SearchTarget
+        {
+            public UITK.VisualElement Element;   // the row or tile to show or hide
+            public UITK.VisualElement Section;   // the section box it sits in
+            public string Haystack;              // lower-cased, matched with Contains
+        }
+
+        private readonly List<SearchTarget> _searchTargets = new List<SearchTarget>();
+        private readonly List<UITK.VisualElement> _searchSections = new List<UITK.VisualElement>();
+
+        /// <summary>Intro blurbs - hidden while a query is active so results are not buried.</summary>
+        private readonly List<UITK.VisualElement> _searchChrome = new List<UITK.VisualElement>();
+
+        // Reused by the filter pass so a keystroke does not allocate.
+        private readonly HashSet<UITK.VisualElement> _sectionsWithMatch = new HashSet<UITK.VisualElement>();
+
+        private UITK.TextField _searchField;
+        private string _searchQuery = string.Empty;
+
         private bool _isVisible;
 
         /// <summary>
@@ -284,10 +314,19 @@ namespace MaxPractice
 
             // Rebuild on open: the config can be reloaded between visits, and the
             // enabled/disabled state is baked into the rows and tiles.
+            //
+            // The search index points at the elements those rebuilds are about to throw
+            // away, so it has to be dropped first. The three builders below refill it.
+            ResetSearchIndex();
             BuildActionsBody();
             BuildCommandsBody();
             BuildServerBody();
             RefreshBinds();
+
+            // The query survives between visits (the field keeps its text - CreateUI runs
+            // once), so the rebuilt rows have to be put through it again or an open panel
+            // would show everything while the field still reads as filtered.
+            ApplySearchFilter();
 
             _backdrop.style.display = UITK.DisplayStyle.Flex;
             _panel.style.display = UITK.DisplayStyle.Flex;
@@ -560,20 +599,41 @@ namespace MaxPractice
                 _panel.RegisterCallback<UITK.PointerUpEvent>(e => e.StopPropagation());
                 root.Add(_panel);
 
+                // Title block and search share one row, bottom-aligned, the way
+                // CompetitiveAdjustments' header does it - the title column takes the slack
+                // and the search keeps its width on the right.
+                var headerRow = new UITK.VisualElement();
+                headerRow.style.flexDirection = UITK.FlexDirection.Row;
+                headerRow.style.alignItems = UITK.Align.FlexEnd;
+                headerRow.style.flexShrink = 0f;
+                _panel.Add(headerRow);
+
+                var headerCol = new UITK.VisualElement();
+                headerCol.style.flexDirection = UITK.FlexDirection.Column;
+                headerCol.style.flexGrow = 1f;
+                headerCol.style.flexShrink = 1f;
+                headerCol.style.minWidth = 0f;
+                headerRow.Add(headerCol);
+
                 var titleRow = new UITK.VisualElement();
                 titleRow.style.flexDirection = UITK.FlexDirection.Row;
                 titleRow.style.alignItems = UITK.Align.Center;
                 titleRow.style.marginBottom = 4;
                 titleRow.Add(Title("MAX", TextPrimary));
                 titleRow.Add(Title(" PRACTICE", Accent));
-                _panel.Add(titleRow);
+                headerCol.Add(titleRow);
 
                 var subtitle = new UITK.Label("Practice tools  ·  F3 to toggle  ·  Esc to close");
                 subtitle.style.fontSize = 12;
                 subtitle.style.color = new UITK.StyleColor(TextMuted);
                 subtitle.style.marginBottom = 12;
                 ForceUIFont(subtitle);
-                _panel.Add(subtitle);
+                headerCol.Add(subtitle);
+
+                var searchAside = BuildSearchBar();
+                searchAside.style.flexShrink = 0f;
+                searchAside.style.marginBottom = 12;
+                headerRow.Add(searchAside);
 
                 var tabBar = new UITK.VisualElement();
                 tabBar.style.flexDirection = UITK.FlexDirection.Row;
@@ -586,6 +646,8 @@ namespace MaxPractice
                 tabBar.Add(_tabActions);
                 tabBar.Add(_tabCommands);
                 tabBar.Add(_tabServer);
+
+
 
                 _actionsBody = MakeBody();
                 _commandsBody = MakeBody();
@@ -675,13 +737,13 @@ namespace MaxPractice
             _actionsBody.Clear();
             _actionTiles.Clear();
 
-            _actionsBody.Add(Note(
-                "Click to run. Each button shows its bind, or the command if there isn' + chr(39) + 't one; set binds " +
+            AddBodyChrome(_actionsBody, Note(
+                "Click to run. Each button shows its bind, or the command if there isn't one; set binds " +
                 "on the Binds tab. The menu stays open, so you can lay a whole drill out in one go.", TextMuted));
 
             foreach (var group in CATALOGUE)
             {
-                var section = AddSection(_actionsBody, group.Title, group.Subtitle);
+                var section = SearchableSection(_actionsBody, group.Title, group.Subtitle);
 
                 var grid = new UITK.VisualElement();
                 grid.style.flexDirection = UITK.FlexDirection.Row;
@@ -690,7 +752,13 @@ namespace MaxPractice
                 section.Add(grid);
 
                 foreach (var def in group.Items)
-                    grid.Add(MakeActionTile(def));
+                {
+                    var tile = MakeActionTile(def);
+                    grid.Add(tile);
+                    // Findable by label, by the slash command it runs and by its description,
+                    // so "cone", "/cones" and "stickhandling" all reach the same tile.
+                    MarkSearchable(tile, section, def.Name, def.Command, def.Detail, group.Title);
+                }
 
                 if (!string.IsNullOrEmpty(group.Footnote))
                     section.Add(SectionFootnote(group.Footnote));
@@ -794,15 +862,19 @@ namespace MaxPractice
             _commandsBody.Clear();
             _bindStrips.Clear();
 
-            _commandsBody.Add(Note(
+            AddBodyChrome(_commandsBody, Note(
                 "Run a command from here, or give it a key and fire it without opening the menu. " +
                 "Most of these only work during warmup.", TextMuted));
 
             foreach (var group in CATALOGUE)
             {
-                var section = AddSection(_commandsBody, group.Title, group.Subtitle);
+                var section = SearchableSection(_commandsBody, group.Title, group.Subtitle);
                 foreach (var def in group.Items)
-                    section.Add(MakeCommandRow(def));
+                {
+                    var row = MakeCommandRow(def);
+                    section.Add(row);
+                    MarkSearchable(row, section, def.Name, def.Command, def.Detail, group.Title);
+                }
 
                 if (!string.IsNullOrEmpty(group.Footnote))
                     section.Add(SectionFootnote(group.Footnote));
@@ -1003,55 +1075,55 @@ namespace MaxPractice
                 return;
             }
 
-            _serverBody.Add(Note(
+            AddBodyChrome(_serverBody, Note(
                 "What this MaxPractice install has switched on, read from config/maxpractice.json. " +
                 "On a listen server that is the live server config. If you joined someone else's " +
                 "server, this is only your own copy and the host's may differ.", TextMuted));
 
-            var commands = AddSection(_serverBody, "Commands");
-            commands.Add(MakeStateRow("Spawn puck", cfg.EnableSpawnPuck));
-            commands.Add(MakeStateRow("Backpass", cfg.EnableBackpass));
-            commands.Add(MakeStateRow("Pass", cfg.EnablePass));
-            commands.Add(MakeStateRow("Yoyo", cfg.EnableYoyo));
-            commands.Add(MakeStateRow("Pop", cfg.EnablePop));
-            commands.Add(MakeStateRow("Save practice", cfg.EnableSavePrac));
-            commands.Add(MakeStateRow("Tip practice", cfg.EnableTipPrac));
-            commands.Add(MakeStateRow("Cones", cfg.EnableCones));
-            commands.Add(MakeStateRow("Minefield", cfg.EnableMinefield));
-            commands.Add(MakeStateRow("Traffic", cfg.EnableTraffic));
-            commands.Add(MakeStateRow("AI goalie", cfg.EnableDummy));
-            commands.Add(MakeStateRow("Infinite stamina", cfg.EnableInfiniteStamina));
-            commands.Add(MakeStateRow("Stick taps", cfg.EnableTapCommands));
-            commands.Add(MakeStateRow("Practice sheets", cfg.EnableRinkSheets));
+            var commands = SearchableSection(_serverBody, "Commands");
+            AddRow(commands, MakeStateRow("Spawn puck", cfg.EnableSpawnPuck), "Spawn puck");
+            AddRow(commands, MakeStateRow("Backpass", cfg.EnableBackpass), "Backpass");
+            AddRow(commands, MakeStateRow("Pass", cfg.EnablePass), "Pass");
+            AddRow(commands, MakeStateRow("Yoyo", cfg.EnableYoyo), "Yoyo");
+            AddRow(commands, MakeStateRow("Pop", cfg.EnablePop), "Pop");
+            AddRow(commands, MakeStateRow("Save practice", cfg.EnableSavePrac), "Save practice");
+            AddRow(commands, MakeStateRow("Tip practice", cfg.EnableTipPrac), "Tip practice");
+            AddRow(commands, MakeStateRow("Cones", cfg.EnableCones), "Cones");
+            AddRow(commands, MakeStateRow("Minefield", cfg.EnableMinefield), "Minefield");
+            AddRow(commands, MakeStateRow("Traffic", cfg.EnableTraffic), "Traffic");
+            AddRow(commands, MakeStateRow("AI goalie", cfg.EnableDummy), "AI goalie");
+            AddRow(commands, MakeStateRow("Infinite stamina", cfg.EnableInfiniteStamina), "Infinite stamina");
+            AddRow(commands, MakeStateRow("Stick taps", cfg.EnableTapCommands), "Stick taps");
+            AddRow(commands, MakeStateRow("Practice sheets", cfg.EnableRinkSheets), "Practice sheets");
 
-            var limits = AddSection(_serverBody, "Limits");
-            limits.Add(MakeValueRow("Cone sets per player", cfg.ConesPerPlayer.ToString()));
-            limits.Add(MakeValueRow("Minefields per player", cfg.MinefieldPerPlayer.ToString()));
-            limits.Add(MakeValueRow("Traffic per player", cfg.TrafficPerPlayer.ToString()));
-            limits.Add(MakeValueRow("Save practice length", cfg.SavePracDurationSeconds + "s"));
-            limits.Add(MakeValueRow("Puck cleanup threshold", cfg.MaxPucksBeforeCleanup.ToString()));
-            limits.Add(MakeValueRow("Clear-command cooldown",
-                cfg.ClearCommandCooldownSeconds <= 0f ? "off" : cfg.ClearCommandCooldownSeconds + "s"));
+            var limits = SearchableSection(_serverBody, "Limits");
+            AddRow(limits, MakeValueRow("Cone sets per player", cfg.ConesPerPlayer.ToString()), "Cone sets per player");
+            AddRow(limits, MakeValueRow("Minefields per player", cfg.MinefieldPerPlayer.ToString()), "Minefields per player");
+            AddRow(limits, MakeValueRow("Traffic per player", cfg.TrafficPerPlayer.ToString()), "Traffic per player");
+            AddRow(limits, MakeValueRow("Save practice length", cfg.SavePracDurationSeconds + "s"), "Save practice length");
+            AddRow(limits, MakeValueRow("Puck cleanup threshold", cfg.MaxPucksBeforeCleanup.ToString()), "Puck cleanup threshold");
+            AddRow(limits, MakeValueRow("Clear-command cooldown",
+                cfg.ClearCommandCooldownSeconds <= 0f ? "off" : cfg.ClearCommandCooldownSeconds + "s"), "Clear-command cooldown");
 
-            var behaviour = AddSection(_serverBody, "Behaviour");
-            behaviour.Add(MakeStateRow("Cone visuals", cfg.ConeVisuals));
-            behaviour.Add(MakeStateRow("AI goalies persist through every phase", cfg.GoalieAIPersistDuringGame));
-            behaviour.Add(MakeStateRow("Vote for AI goalies", cfg.EnableGoalieVoting));
-            behaviour.Add(MakeStateRow("Warmup timer paused", cfg.PauseWarmupTimer));
-            behaviour.Add(MakeStateRow("Game-start voting blocked", cfg.DisableVoting));
-            behaviour.Add(MakeStateRow("AI hidden from the scoreboard", cfg.HideAIFromScoreboard));
+            var behaviour = SearchableSection(_serverBody, "Behaviour");
+            AddRow(behaviour, MakeStateRow("Cone visuals", cfg.ConeVisuals), "Cone visuals");
+            AddRow(behaviour, MakeStateRow("AI goalies persist through every phase", cfg.GoalieAIPersistDuringGame), "AI goalies persist through every phase");
+            AddRow(behaviour, MakeStateRow("Vote for AI goalies", cfg.EnableGoalieVoting), "Vote for AI goalies");
+            AddRow(behaviour, MakeStateRow("Warmup timer paused", cfg.PauseWarmupTimer), "Warmup timer paused");
+            AddRow(behaviour, MakeStateRow("Game-start voting blocked", cfg.DisableVoting), "Game-start voting blocked");
+            AddRow(behaviour, MakeStateRow("AI hidden from the scoreboard", cfg.HideAIFromScoreboard), "AI hidden from the scoreboard");
 
             if (cfg.EnableRinkSheets)
             {
-                var sheets = AddSection(_serverBody, "Practice sheets");
-                sheets.Add(MakeValueRow("Rinks (including the arena's)", cfg.MaxRinkSheets.ToString()));
-                sheets.Add(MakeValueRow("Layout", cfg.RinkSheetLayout));
-                sheets.Add(MakeValueRow("Spacing",
+                var sheets = SearchableSection(_serverBody, "Practice sheets");
+                AddRow(sheets, MakeValueRow("Rinks (including the arena's)", cfg.MaxRinkSheets.ToString()), "Rinks (including the arena's)");
+                AddRow(sheets, MakeValueRow("Layout", cfg.RinkSheetLayout), "Layout");
+                AddRow(sheets, MakeValueRow("Spacing",
                     MaxPractice.SheetLayout.ParseMode(cfg.RinkSheetLayout) == MaxPractice.SheetLayoutMode.Vertical
                         ? cfg.RinkSheetVerticalSpacing + "m down"
-                        : cfg.RinkSheetGridSpacingX + "m x " + cfg.RinkSheetGridSpacingZ + "m"));
-                sheets.Add(MakeValueRow("Empty rink torn down after",
-                    cfg.RinkSheetIdleTimeoutSeconds <= 0f ? "never" : cfg.RinkSheetIdleTimeoutSeconds + "s"));
+                        : cfg.RinkSheetGridSpacingX + "m x " + cfg.RinkSheetGridSpacingZ + "m"), "Spacing");
+                AddRow(sheets, MakeValueRow("Empty rink torn down after",
+                    cfg.RinkSheetIdleTimeoutSeconds <= 0f ? "never" : cfg.RinkSheetIdleTimeoutSeconds + "s"), "Empty rink torn down after");
             }
         }
 
@@ -1183,6 +1255,219 @@ namespace MaxPractice
             SetTabVisual(_tabActions, t == UiTab.Actions);
             SetTabVisual(_tabCommands, t == UiTab.Commands);
             SetTabVisual(_tabServer, t == UiTab.Server);
+        }
+
+        // ------------------------------------------------------------------
+        // Search
+        // ------------------------------------------------------------------
+
+        /// <summary>
+        /// The search row, laid out the way CompetitiveAdjustments lays out its own: a bold,
+        /// letter-spaced SEARCH caption and a fixed-width field, handed to the header so it
+        /// sits bottom-aligned to the right of the title rather than on a row of its own.
+        ///
+        /// No placeholder and no clear button, also matching - the caption already says what
+        /// the field is for, and Escape/retyping is how their panel clears it.
+        /// </summary>
+        private UITK.VisualElement BuildSearchBar()
+        {
+            var row = new UITK.VisualElement();
+            row.style.flexDirection = UITK.FlexDirection.Row;
+            row.style.alignItems = UITK.Align.Center;
+
+            var caption = new UITK.Label("SEARCH");
+            caption.style.fontSize = 11;
+            caption.style.color = new UITK.StyleColor(TextMuted);
+            caption.style.unityFontStyleAndWeight = FontStyle.Bold;
+            caption.style.letterSpacing = 3f;
+            caption.style.marginRight = 8;
+            caption.style.flexShrink = 0f;
+            ForceUIFont(caption);
+            row.Add(caption);
+
+            var field = new UITK.TextField { value = _searchQuery };
+            field.style.width = 200;
+            field.style.height = 28;
+            field.style.marginLeft = 0;
+            field.style.marginRight = 0;
+            field.style.marginTop = 0;
+            field.style.marginBottom = 0;
+            field.style.backgroundColor = new UITK.StyleColor(RowBg);
+            field.style.color = new UITK.StyleColor(TextPrimary);
+            field.style.justifyContent = UITK.Justify.Center;
+            SetRadius(field, 5f);
+            SetBorderWidth(field, 1f);
+            SetBorderColor(field, PanelBorder);
+            ForceUIFont(field);
+
+            // The inner input element carries its own background, padding and border. Flatten
+            // it onto the field's own chrome so the control reads as one box.
+            var input = field.Q(className: "unity-base-text-field__input");
+            if (input != null)
+            {
+                var istyle = input.style;
+                istyle.backgroundColor = new UITK.StyleColor(RowBg);
+                istyle.color = new UITK.StyleColor(TextPrimary);
+                istyle.paddingLeft = 8;
+                istyle.paddingRight = 8;
+                istyle.paddingTop = 0;
+                istyle.paddingBottom = 0;
+                istyle.marginTop = 0;
+                istyle.marginBottom = 0;
+                istyle.marginLeft = 0;
+                istyle.marginRight = 0;
+                istyle.justifyContent = UITK.Justify.Center;
+                istyle.overflow = UITK.Overflow.Hidden;
+                SetBorderWidth(input, 0f);
+                SetRadius(input, 5f);
+                ForceUIFont(input);
+            }
+
+            // The element that actually draws the typed text, and the reason the field
+            // overflowed without this: left alone it renders at the game's default control
+            // size, which is taller than the 28px box, so the glyphs spilled past the border
+            // and sat high. Sizing it and anchoring it MiddleLeft is what makes the text sit
+            // on the box's centre line instead.
+            var text = field.Q<UITK.TextElement>();
+            if (text != null)
+            {
+                var tstyle = text.style;
+                tstyle.color = new UITK.StyleColor(TextPrimary);
+                tstyle.backgroundColor = new UITK.StyleColor(Color.clear);
+                tstyle.fontSize = 13;
+                tstyle.unityTextAlign = new UITK.StyleEnum<TextAnchor>(TextAnchor.MiddleLeft);
+                tstyle.whiteSpace = UITK.WhiteSpace.NoWrap;
+                tstyle.overflow = UITK.Overflow.Hidden;
+                tstyle.paddingTop = 0;
+                tstyle.paddingBottom = 0;
+                tstyle.marginTop = 0;
+                tstyle.marginBottom = 0;
+                tstyle.flexGrow = 1f;
+                ForceUIFont(text);
+            }
+
+            field.RegisterValueChangedCallback(e => SetSearchQuery(e.newValue));
+            _searchField = field;
+            row.Add(field);
+
+            return row;
+        }
+
+        private void SetSearchQuery(string raw)
+        {
+            _searchQuery = string.IsNullOrWhiteSpace(raw) ? string.Empty : raw.Trim().ToLowerInvariant();
+            ApplySearchFilter();
+        }
+
+        /// <summary>Drop the index. Called before the three bodies are rebuilt.</summary>
+        private void ResetSearchIndex()
+        {
+            _searchTargets.Clear();
+            _searchSections.Clear();
+            _searchChrome.Clear();
+        }
+
+        /// <summary>
+        /// Register a row or tile under <paramref name="section"/>, findable by any of
+        /// <paramref name="parts"/>. Null and blank parts are skipped.
+        /// </summary>
+        private void MarkSearchable(UITK.VisualElement element, UITK.VisualElement section, params string[] parts)
+        {
+            if (element == null) return;
+
+            var sb = new System.Text.StringBuilder();
+            if (parts != null)
+            {
+                for (int i = 0; i < parts.Length; i++)
+                {
+                    if (string.IsNullOrEmpty(parts[i])) continue;
+                    if (sb.Length > 0) sb.Append(' ');
+                    sb.Append(parts[i]);
+                }
+            }
+
+            _searchTargets.Add(new SearchTarget
+            {
+                Element = element,
+                Section = section,
+                Haystack = sb.ToString().ToLowerInvariant(),
+            });
+        }
+
+        /// <summary>AddSection, plus registration so the box can be hidden once it empties.</summary>
+        private UITK.VisualElement SearchableSection(UITK.VisualElement parent, string label, string subtitle = null)
+        {
+            var box = AddSection(parent, label, subtitle);
+            _searchSections.Add(box);
+            return box;
+        }
+
+        /// <summary>
+        /// Add a row to a section and index it under the label it displays.
+        ///
+        /// The Server tab is a flat list of label/value rows rather than catalogue entries, so
+        /// there is no CmdDef to search by - the visible label is the whole haystack.
+        /// </summary>
+        private void AddRow(UITK.VisualElement section, UITK.VisualElement row, string label)
+        {
+            if (section == null || row == null) return;
+            section.Add(row);
+            MarkSearchable(row, section, label);
+        }
+
+        /// <summary>
+        /// A body's intro blurb. Registered as chrome so it steps aside while a query is
+        /// active - the same move CompetitiveAdjustments makes with its section headers.
+        /// </summary>
+        private void AddBodyChrome(UITK.VisualElement body, UITK.Label intro)
+        {
+            if (intro == null) return;
+            body.Add(intro);
+            _searchChrome.Add(intro);
+        }
+
+        /// <summary>
+        /// Show the rows whose text contains the query, hide every section left with nothing
+        /// showing, and let a body that matched nothing at all say so.
+        /// </summary>
+        private void ApplySearchFilter()
+        {
+            bool searching = _searchQuery.Length > 0;
+
+            _sectionsWithMatch.Clear();
+
+            for (int i = 0; i < _searchTargets.Count; i++)
+            {
+                SearchTarget t = _searchTargets[i];
+                if (t.Element == null) continue;
+
+                bool show = !searching || t.Haystack.IndexOf(_searchQuery, StringComparison.Ordinal) >= 0;
+                t.Element.style.display = show ? UITK.DisplayStyle.Flex : UITK.DisplayStyle.None;
+                if (show && t.Section != null) _sectionsWithMatch.Add(t.Section);
+            }
+
+            for (int i = 0; i < _searchSections.Count; i++)
+            {
+                UITK.VisualElement section = _searchSections[i];
+                if (section == null) continue;
+
+                // The header goes while a query is up, so results read as one flat list
+                // instead of a column of group titles with a row under each. AddSection
+                // always adds MakeSectionHeader first, so child 0 is the header.
+                if (section.childCount > 0)
+                {
+                    section[0].style.display = searching ? UITK.DisplayStyle.None : UITK.DisplayStyle.Flex;
+                }
+
+                bool show = !searching || _sectionsWithMatch.Contains(section);
+                section.style.display = show ? UITK.DisplayStyle.Flex : UITK.DisplayStyle.None;
+            }
+
+            for (int i = 0; i < _searchChrome.Count; i++)
+            {
+                if (_searchChrome[i] != null)
+                    _searchChrome[i].style.display = searching ? UITK.DisplayStyle.None : UITK.DisplayStyle.Flex;
+            }
         }
 
         private static UITK.VisualElement AddSection(UITK.VisualElement parent, string label, string subtitle = null)
